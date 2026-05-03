@@ -1,0 +1,6 @@
+{
+  "name": "Subconscious Particles",
+  "description": "An interactive, immersive particle visualization tool. Upload an image to transform it into a fluid, responsive particle field.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}

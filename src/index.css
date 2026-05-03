@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+/* 移动端 Web：满屏高度 + 减少橡皮筋滚动与点击高亮 */
+html {
+  height: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100%;
+  min-height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: #050505;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#root {
+  min-height: 100%;
+  min-height: 100dvh;
+}
+
+/* AI 浮层衬线：拉丁用 Instrument Serif 真斜体；中文回退 Noto Serif SC / 系统宋体（汉字多为伪斜体） */
+.font-ai-reply {
+  font-family:
+    "Instrument Serif",
+    "Noto Serif SC",
+    "Songti SC",
+    "STSong",
+    "SimSun",
+    ui-serif,
+    Georgia,
+    "Times New Roman",
+    serif;
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none; /* IE and Edge */
+    scrollbar-width: none; /* Firefox */
+  }
+
+  .touch-manipulation {
+    touch-action: manipulation;
+  }
+}
