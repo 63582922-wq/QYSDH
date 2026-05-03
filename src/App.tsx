@@ -86,12 +86,12 @@ class Particle {
       rotatedY = canvasCenter.y + dy * scale;
     }
 
-    // Breathing：内部弱、外缘更强，轮廓更易「散」开
-    const breathMul = 0.16 + this.edgeFactor * 1.55;
+    // Breathing：位移「呼吸」略加强，整体更有生命感
+    const breathMul = 0.36 + this.edgeFactor * 1.22;
     const breathX =
-      Math.sin(time * 0.0008 + this.originY * 0.01) * (1 + audioTremor) * breathMul;
+      Math.sin(time * 0.00085 + this.originY * 0.01) * (1 + audioTremor) * breathMul;
     const breathY =
-      Math.cos(time * 0.0008 + this.originX * 0.01) * (1 + audioTremor) * breathMul;
+      Math.cos(time * 0.00085 + this.originX * 0.01) * (1 + audioTremor) * breathMul;
 
     // 散射：中高 edge 显著加大 + 二次项，外缘更涣散
     const ef = this.edgeFactor;
@@ -180,7 +180,7 @@ class Particle {
     this.y += (this.vy *= this.friction) + (targetY - this.y) * this.ease;
   }
 
-  draw(ctx: CanvasRenderingContext2D, colorMode: string, customHex: string) {
+  draw(ctx: CanvasRenderingContext2D, colorMode: string, customHex: string, time: number) {
     if (colorMode === 'original') {
       ctx.fillStyle = this.color;
     } else if (colorMode === 'ghost') {
@@ -196,8 +196,12 @@ class Particle {
     } else {
       ctx.fillStyle = this.color;
     }
-    // 用圆点而非 fillRect，否则每个粒子都是方形像素块
-    const r = Math.max(0.35, this.size * 0.5);
+    // 半径随时间略胀缩（每粒相位不同），叠加位移呼吸更明显
+    const sizeBreath =
+      1 +
+      0.1 * Math.sin(time * 0.0014 + this.drift + this.originX * 0.012 + this.originY * 0.011) +
+      0.04 * this.edgeFactor * Math.sin(time * 0.0011 + this.drift * 2);
+    const r = Math.max(0.35, this.size * 0.5 * sizeBreath);
     const cx = this.x + r;
     const cy = this.y + r;
     ctx.beginPath();
@@ -277,11 +281,14 @@ function drawEdgeMesh(
 ) {
   if (!particles.length) return;
 
-  const pulse = 0.82 + Math.sin(time * 0.0012) * 0.18;
-  // 与最初网状版相同的线宽/结构，仅略提透明度与浅色，更易看见
-  const chainA = 0.13 * pulse;
-  const spokeA = 0.078 * pulse;
-  const crossA = 0.052 * pulse;
+  // 明显一些的「呼吸灯」：透明度 + 线宽随 time 起伏（原先 sin 系数小，几乎看不出）
+  const w = 0.5 + 0.5 * Math.sin(time * 0.002);
+  const chainA = 0.085 + 0.1 * w;
+  const spokeA = 0.05 + 0.09 * w;
+  const crossA = 0.03 + 0.08 * w;
+  const lwMain = 0.68 + 0.38 * w;
+  const lwCross = 0.52 + 0.32 * w;
+  const lwSpoke = 0.6 + 0.36 * w;
 
   ctx.save();
   ctx.lineCap = 'round';
@@ -289,8 +296,8 @@ function drawEdgeMesh(
 
   const strokeChain = (indices: number[]) => {
     if (indices.length < 2) return;
-    ctx.strokeStyle = `rgba(196, 193, 212, ${chainA})`;
-    ctx.lineWidth = 0.85;
+    ctx.strokeStyle = `rgba(210, 206, 228, ${chainA})`;
+    ctx.lineWidth = lwMain;
     for (let k = 0; k < indices.length - 1; k++) {
       const pa = particles[indices[k]];
       const pb = particles[indices[k + 1]];
@@ -299,8 +306,8 @@ function drawEdgeMesh(
       ctx.lineTo(pb.x, pb.y);
       ctx.stroke();
     }
-    ctx.lineWidth = 0.65;
-    ctx.strokeStyle = `rgba(178, 175, 194, ${crossA})`;
+    ctx.lineWidth = lwCross;
+    ctx.strokeStyle = `rgba(188, 184, 208, ${crossA})`;
     for (let k = 0; k < indices.length - 2; k++) {
       const pa = particles[indices[k]];
       const pb = particles[indices[k + 2]];
@@ -316,8 +323,8 @@ function drawEdgeMesh(
   strokeChain(mesh.top);
   strokeChain(mesh.bottom);
 
-  ctx.lineWidth = 0.75;
-  ctx.strokeStyle = `rgba(188, 185, 204, ${spokeA})`;
+  ctx.lineWidth = lwSpoke;
+  ctx.strokeStyle = `rgba(200, 196, 220, ${spokeA})`;
 
   for (let k = 0; k < mesh.left.length; k += 2) {
     const p = particles[mesh.left[k]];
@@ -579,8 +586,8 @@ export default function App() {
     let time = 0;
 
     const render = () => {
-      // Create a trailing effect for "quiet, immersive" motion blur
-      ctx.fillStyle = 'rgba(5, 5, 5, 0.4)';
+      // 拖尾略淡一点，粒子明暗/半径呼吸更容易被看见
+      ctx.fillStyle = 'rgba(5, 5, 5, 0.34)';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
       // Create a radial gradient vignette to hide the canvas edges
@@ -611,6 +618,9 @@ export default function App() {
       // Left-right yaw around image center.
       // Slightly faster: one full sway cycle per 45 seconds.
       const rotation3D = Math.sin((performance.now() * 2 * Math.PI) / 45000) * (Math.PI / 10);
+      // 整层粒子明暗「呼吸」（略加大摆幅与频率，拖尾下仍可见）
+      const ambientBreath = 0.8 + 0.2 * Math.sin(time * 0.00195);
+      ctx.globalAlpha = ambientBreath;
       for (let i = 0; i < particlesRef.current.length; i++) {
         const p = particlesRef.current[i];
         p.update(
@@ -621,8 +631,9 @@ export default function App() {
           { force: Math.max(audioForce, speechIntensityRef.current * 80), bass: Math.max(bass, speechIntensityRef.current * 200) },
           rotationCenter,
         );
-        p.draw(ctx, colorMode, customColor);
+        p.draw(ctx, colorMode, customColor, time);
       }
+      ctx.globalAlpha = 1;
 
       drawEdgeMesh(ctx, particlesRef.current, edgeMeshIndexRef.current, canvas.width, canvas.height, time);
 
