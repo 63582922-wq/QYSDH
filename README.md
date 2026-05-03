@@ -16,5 +16,6 @@ View your app in AI Studio: https://ai.studio/apps/7c2d2cc1-e438-425e-a0ac-4e31b
 1. Install dependencies:
    `npm install`
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+3. Optional: set `MINIMAX_API_KEY` (and optionally `MINIMAX_VOICE_ID`, `MINIMAX_TTS_MODEL`) so AI replies are spoken via MiniMax TTS instead of the browser voice. Local `npm run dev` proxies `/minimax-api` to `api.minimax.io` to avoid CORS.
+4. Run the app:
    `npm run dev`

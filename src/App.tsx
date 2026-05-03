@@ -4,8 +4,21 @@
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Settings2, X, RefreshCw, Dna, Languages, Save } from 'lucide-react';
+import { Settings2, X, RefreshCw, Dna, Languages, Save, FileAudio, Loader2 } from 'lucide-react';
 import ChatOverlay, { type ChatOverlayHandle } from './components/ChatOverlay';
+import {
+  getAudioFileDurationSec,
+  getMinimaxApiKey,
+  MINIMAX_CLONE_MAX_DURATION_SEC,
+  MINIMAX_CLONE_MIN_DURATION_SEC,
+  MINIMAX_CLONED_VOICE_STORAGE_KEY,
+  newClonedVoiceId,
+  readStoredMinimaxClonedVoiceId,
+  requestMinimaxVoiceClone,
+  uploadMinimaxVoiceCloneSource,
+  validateCloneAudioFile,
+  writeStoredMinimaxClonedVoiceId,
+} from './minimaxVoiceClone';
 
 
 // --- Particle Engine ---
@@ -377,6 +390,113 @@ export default function App() {
   const [language, setLanguage] = useState<'zh' | 'en'>('zh');
   const [isAudioReactive, setIsAudioReactive] = useState(false);
   const [isAutoSpeak, setIsAutoSpeak] = useState(() => localStorage.getItem('subconscious_auto_speak') === 'true');
+
+  const cloneAudioInputRef = useRef<HTMLInputElement>(null);
+  const cloneJobAbortRef = useRef<AbortController | null>(null);
+  const [clonedMinimaxVoiceId, setClonedMinimaxVoiceId] = useState<string | null>(() => readStoredMinimaxClonedVoiceId());
+  const [cloneVoiceBusy, setCloneVoiceBusy] = useState(false);
+  const [cloneVoiceHint, setCloneVoiceHint] = useState('');
+
+  useEffect(() => {
+    return () => {
+      cloneJobAbortRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === MINIMAX_CLONED_VOICE_STORAGE_KEY) {
+        setClonedMinimaxVoiceId(readStoredMinimaxClonedVoiceId());
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  const clearClonedMinimaxVoice = useCallback(() => {
+    cloneJobAbortRef.current?.abort();
+    cloneJobAbortRef.current = null;
+    writeStoredMinimaxClonedVoiceId(null);
+    setClonedMinimaxVoiceId(null);
+    setCloneVoiceHint(
+      language === 'zh' ? '已恢复为默认音色（环境变量或系统内置）。' : 'Reverted to default voice (env or built-in).',
+    );
+  }, [language]);
+
+  const handleCloneAudioSelected = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = '';
+      if (!file || !getMinimaxApiKey()) return;
+
+      const bad = validateCloneAudioFile(file, language);
+      if (bad) {
+        setCloneVoiceHint(bad);
+        return;
+      }
+
+      cloneJobAbortRef.current?.abort();
+      const ac = new AbortController();
+      cloneJobAbortRef.current = ac;
+
+      void (async () => {
+        setCloneVoiceBusy(true);
+        setCloneVoiceHint(language === 'zh' ? '校验时长…' : 'Checking duration…');
+        try {
+          const dur = await getAudioFileDurationSec(file);
+          if (dur < MINIMAX_CLONE_MIN_DURATION_SEC) {
+            setCloneVoiceHint(
+              language === 'zh'
+                ? `录音至少 ${MINIMAX_CLONE_MIN_DURATION_SEC} 秒（当前约 ${Math.round(dur)} 秒）。`
+                : `Need at least ${MINIMAX_CLONE_MIN_DURATION_SEC}s (about ${Math.round(dur)}s now).`,
+            );
+            return;
+          }
+          if (dur > MINIMAX_CLONE_MAX_DURATION_SEC) {
+            setCloneVoiceHint(
+              language === 'zh'
+                ? `录音最长 ${MINIMAX_CLONE_MAX_DURATION_SEC / 60} 分钟。`
+                : `Max length is ${MINIMAX_CLONE_MAX_DURATION_SEC / 60} minutes.`,
+            );
+            return;
+          }
+          if (ac.signal.aborted) return;
+
+          setCloneVoiceHint(language === 'zh' ? '上传中…' : 'Uploading…');
+          const fileId = await uploadMinimaxVoiceCloneSource(file, ac.signal);
+          if (ac.signal.aborted) return;
+
+          setCloneVoiceHint(language === 'zh' ? '复刻中…' : 'Cloning…');
+          const voiceId = newClonedVoiceId();
+          await requestMinimaxVoiceClone({
+            sourceFileId: fileId,
+            voiceId,
+            signal: ac.signal,
+          });
+          if (ac.signal.aborted) return;
+
+          writeStoredMinimaxClonedVoiceId(voiceId);
+          setClonedMinimaxVoiceId(voiceId);
+          const idTail = voiceId.length > 14 ? `${voiceId.slice(0, 10)}…${voiceId.slice(-6)}` : voiceId;
+          setCloneVoiceHint(
+            language === 'zh'
+              ? `复刻成功。音色 ID（已保存，T2A 即用此 id）：${idTail}。开启「朗读回复」后，AI 将用你的音色说话。`
+              : `Clone ready. Voice ID (saved for T2A): ${idTail}. Turn on read responses to hear replies in your voice.`,
+          );
+        } catch (err) {
+          if (ac.signal.aborted) return;
+          const msg = String((err as Error)?.message || err);
+          setCloneVoiceHint(
+            language === 'zh' ? `复刻失败：${msg.slice(0, 160)}` : `Clone failed: ${msg.slice(0, 160)}`,
+          );
+        } finally {
+          if (cloneJobAbortRef.current === ac) cloneJobAbortRef.current = null;
+          setCloneVoiceBusy(false);
+        }
+      })();
+    },
+    [language],
+  );
   
   // Audio Config
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -897,6 +1017,55 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {getMinimaxApiKey() ? (
+            <div className="space-y-2 border-t border-zinc-900 pt-4 md:space-y-3 md:pt-4">
+              <div className="text-xs font-medium uppercase tracking-widest text-zinc-500">
+                {language === 'zh' ? 'MiniMax 复刻音色' : 'MiniMax voice clone'}
+              </div>
+              <input
+                ref={cloneAudioInputRef}
+                type="file"
+                accept=".mp3,.m4a,.wav,.aac,audio/mpeg,audio/wav,audio/wave,audio/mp4,audio/x-m4a,audio/m4a,audio/aac,audio/quicktime,audio/*"
+                className="hidden"
+                onChange={handleCloneAudioSelected}
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={cloneVoiceBusy}
+                  onClick={() => cloneAudioInputRef.current?.click()}
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900/80 px-2.5 py-2 text-[10px] font-medium uppercase tracking-wider text-zinc-300 transition-colors hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-40 md:min-h-0 md:py-1.5 md:text-[11px]"
+                >
+                  {cloneVoiceBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" strokeWidth={2} />
+                  ) : (
+                    <FileAudio className="h-3.5 w-3.5 shrink-0" strokeWidth={2} />
+                  )}
+                  {language === 'zh' ? '上传录音复刻音色' : 'Upload audio to clone'}
+                </button>
+                {clonedMinimaxVoiceId ? (
+                  <button
+                    type="button"
+                    onClick={clearClonedMinimaxVoice}
+                    className="inline-flex min-h-[40px] items-center gap-1 rounded-lg border border-zinc-800 px-2 py-2 text-[10px] text-zinc-500 transition-colors hover:border-zinc-600 hover:text-zinc-300 md:min-h-0 md:py-1.5 md:text-[11px]"
+                  >
+                    <X className="h-3 w-3" strokeWidth={2} />
+                    {language === 'zh' ? '清除复刻' : 'Clear clone'}
+                  </button>
+                ) : null}
+              </div>
+              {cloneVoiceHint ? (
+                <p className="text-[11px] leading-snug text-zinc-400 md:text-[10px]">{cloneVoiceHint}</p>
+              ) : (
+                <p className="text-[11px] leading-snug text-zinc-600 md:text-[10px]">
+                  {language === 'zh'
+                    ? '需 mp3 / m4a / wav，时长 10 秒～5 分钟，最大 20MB。'
+                    : 'mp3 / m4a / wav, 10s–5min, max 20MB.'}
+                </p>
+              )}
+            </div>
+          ) : null}
 
           <div className="space-y-2 md:space-y-4">
             <div className="flex items-center justify-between text-xs font-medium uppercase tracking-widest text-zinc-500">

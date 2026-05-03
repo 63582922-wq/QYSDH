@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef, useMemo, useCallback, forwardRef, u
 import { createPortal } from 'react-dom';
 import { Send, Loader2, Mic, MicOff, Dna } from 'lucide-react';
 import { GoogleGenAI, Type, LiveServerMessage, Modality } from '@google/genai';
+import { stripTextForTts, synthesizeMinimaxTtsToMp3Blob } from '../minimaxTts';
+import { getMinimaxApiKey, readStoredMinimaxClonedVoiceId } from '../minimaxVoiceClone';
 
 export interface ChatMessage {
   role: 'user' | 'model';
@@ -14,6 +16,9 @@ export interface ChatSession {
   theme: string;
   messages: ChatMessage[];
   updatedAt: number;
+  /** 在「保存对话 → 镌刻记忆」中确认后写入，用于回忆册粒子展示 */
+  etchedToAlbum?: boolean;
+  etchedAt?: number;
 }
 
 interface ChatOverlayProps {
@@ -40,6 +45,113 @@ if (!process.env.GEMINI_API_KEY) {
 
 const TEXT_MODEL_CANDIDATES = ['gemini-flash-latest', 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash'];
 
+/**
+ * Gemini Multimodal Live（bidi）：须用支持 bidiGenerateContent 的模型 ID。
+ * AI Studio 下拉里写的「Gemini 3 Flash Live」对应模型码为 **gemini-3.1-flash-live-preview**（见官方页与试玩链接）。
+ * 与纯文本的 `gemini-3-flash-preview` 等不是同一个 ID。
+ * @see https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-live-preview
+ * @see https://aistudio.google.com/live?model=gemini-3.1-flash-live-preview
+ *
+ * 仅保留名称含 **live** 的预览模型作为回落：与 AI Studio「Live」一致，不把 2.5 `native-audio` 等混称为 Live。
+ */
+const LIVE_VOICE_MODEL_CANDIDATES = [
+  'gemini-3.1-flash-live-preview',
+  'gemini-2.0-flash-live-preview-04-09',
+];
+
+function liveVoiceModelCandidates(): string[] {
+  const one =
+    typeof process !== 'undefined' && typeof process.env.GEMINI_LIVE_VOICE_MODEL === 'string'
+      ? process.env.GEMINI_LIVE_VOICE_MODEL.trim()
+      : '';
+  if (!one) return [...LIVE_VOICE_MODEL_CANDIDATES];
+  const rest = LIVE_VOICE_MODEL_CANDIDATES.filter((m) => m !== one);
+  return [one, ...rest];
+}
+
+/** 会话内覆盖 Live 音色（优先于 .env）；不设则用环境默认 */
+const LIVE_VOICE_SESSION_STORAGE_KEY = 'subconscious_gemini_live_voice_override';
+
+/**
+ * Gemini `prebuiltVoiceConfig.voiceName` 全量预设（与官方 TTS / Voice Library 同源 30 个）。
+ * @see https://ai.google.dev/gemini-api/docs/speech-generation#voices
+ * Live 模型可能仍忽略个别名；`.env` 自定义名也会并入下拉。
+ */
+const LIVE_PREBUILT_VOICE_OPTIONS: readonly string[] = [
+  'Achernar',
+  'Achird',
+  'Algenib',
+  'Algieba',
+  'Alnilam',
+  'Aoede',
+  'Autonoe',
+  'Callirrhoe',
+  'Charon',
+  'Despina',
+  'Enceladus',
+  'Erinome',
+  'Fenrir',
+  'Gacrux',
+  'Iapetus',
+  'Kore',
+  'Laomedeia',
+  'Leda',
+  'Orus',
+  'Puck',
+  'Pulcherrima',
+  'Rasalgethi',
+  'Sadachbia',
+  'Sadaltager',
+  'Schedar',
+  'Sulafat',
+  'Umbriel',
+  'Vindemiatrix',
+  'Zephyr',
+  'Zubenelgenubi',
+];
+
+/** 仅 .env / define，不含 session 覆盖（用于「默认」标签文案） */
+function getGeminiLiveSpeechVoiceNameFromEnvOnly(): string {
+  const fromVite = import.meta.env.VITE_GEMINI_LIVE_SPEECH_VOICE_NAME;
+  if (fromVite != null && String(fromVite).trim().length > 0) {
+    return String(fromVite).trim();
+  }
+  if (typeof process !== 'undefined' && process.env.GEMINI_LIVE_SPEECH_VOICE_NAME != null) {
+    const t = String(process.env.GEMINI_LIVE_SPEECH_VOICE_NAME).trim();
+    if (t.length > 0) return t;
+  }
+  return 'Orus';
+}
+
+/**
+ * Live 回复音色：session 覆盖 → `VITE_GEMINI_LIVE_SPEECH_VOICE_NAME` → `GEMINI_LIVE_SPEECH_VOICE_NAME` → Orus。
+ * 改 .env 后需重启 dev；会话内可用界面下拉覆盖（无需改文件）。
+ */
+function resolveGeminiLiveSpeechVoiceName(): string {
+  try {
+    const o = sessionStorage.getItem(LIVE_VOICE_SESSION_STORAGE_KEY)?.trim();
+    if (o && o.length > 0) return o;
+  } catch {
+    /* private mode */
+  }
+  return getGeminiLiveSpeechVoiceNameFromEnvOnly();
+}
+
+function getLiveVoiceSelectControlValue(): string {
+  try {
+    const o = sessionStorage.getItem(LIVE_VOICE_SESSION_STORAGE_KEY)?.trim();
+    return o && o.length > 0 ? o : '__DEFAULT__';
+  } catch {
+    return '__DEFAULT__';
+  }
+}
+
+function liveVoiceOptionsForSelect(): string[] {
+  const eff = resolveGeminiLiveSpeechVoiceName();
+  const set = new Set<string>([...LIVE_PREBUILT_VOICE_OPTIONS, eff, getGeminiLiveSpeechVoiceNameFromEnvOnly()]);
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
+
 /** 移动端网络慢时避免永远卡在「等待回复」 */
 const CHAT_SEND_TIMEOUT_MS = 70000;
 
@@ -48,6 +160,9 @@ const MAX_REPLY_CHARS = 8000;
 /** 悬浮气泡内最长展示字符，超出用省略（全文仍在会话里） */
 const MAX_FLOAT_PREVIEW_CHARS = 900;
 const MAX_TTS_CHARS = 4000;
+
+/** Live 回复 PCM 播放略放慢，减轻「赶」的感觉（略降音高，一般可接受） */
+const LIVE_AUDIO_PLAYBACK_RATE = 0.9;
 
 /** AI 悬浮句：仅 CSS 渐显 / 渐隐；无用户新消息时固定时长后消隐 */
 const FLOAT_FADE_MS = 500;
@@ -78,6 +193,83 @@ function sanitizeModelReplyText(text: string): string {
     return `${s.slice(0, MAX_REPLY_CHARS)}\n…`;
   }
   return s;
+}
+
+function pickLiveAudioBase64FromMessage(message: LiveServerMessage): string | undefined {
+  const parts = message.serverContent?.modelTurn?.parts;
+  if (!Array.isArray(parts)) return undefined;
+  for (const part of parts) {
+    const id = (part as { inlineData?: { data?: string; mimeType?: string } }).inlineData;
+    if (id?.data && typeof id.data === 'string' && id.data.length > 0) {
+      return id.data;
+    }
+  }
+  return undefined;
+}
+
+type LiveServerContentExtras = {
+  interrupted?: boolean;
+  /** 模型一轮结束（不同版本字段名可能略有差异，多路径判断） */
+  turnComplete?: boolean;
+  modelTurn?: {
+    turnComplete?: boolean;
+    parts?: Array<{ text?: string; inlineData?: { data?: string } }>;
+  };
+  outputTranscription?: { text?: string };
+  inputTranscription?: { text?: string };
+};
+
+type LiveCaptionTurn = { id: string; user: string; userAlt: string; ai: string; aiAlt: string };
+
+function containsHanScript(s: string): boolean {
+  return /[\u3400-\u9FFF]/.test(s);
+}
+
+/** 从 Live 消息里取字幕：优先 API 的 outputTranscription，其次 modelTurn 文本 */
+function pickLiveCaptionTexts(message: LiveServerMessage): { ai: string | undefined; user: string | undefined } {
+  const sc = message.serverContent as LiveServerContentExtras | undefined;
+  if (!sc) return { ai: undefined, user: undefined };
+  const user = typeof sc.inputTranscription?.text === 'string' ? sc.inputTranscription.text.trim() : undefined;
+  let ai: string | undefined;
+  const ot = sc.outputTranscription?.text;
+  if (typeof ot === 'string' && ot.trim()) {
+    ai = ot.trim();
+  } else {
+    const parts = sc.modelTurn?.parts;
+    if (Array.isArray(parts)) {
+      let t = '';
+      for (const p of parts) {
+        if (typeof p?.text === 'string') t += p.text;
+      }
+      ai = t.trim() || undefined;
+    }
+  }
+  return { ai, user };
+}
+
+function isLiveModelTurnComplete(message: LiveServerMessage): boolean {
+  const sc = message.serverContent as LiveServerContentExtras | undefined;
+  if (!sc) return false;
+  if (sc.turnComplete === true) return true;
+  if (sc.modelTurn?.turnComplete === true) return true;
+  return false;
+}
+
+/**
+ * 合并流式转写：多数情况下服务端发「整段前缀变长」；少数发纯增量则拼接。
+ * 目标：当前轮字幕始终显示**已收到的完整文本**，不丢前半句。
+ */
+function mergeStreamingTranscript(prev: string, incoming: string): string {
+  const a = prev.trimEnd();
+  const b = incoming.trim();
+  if (!b) return a;
+  if (!a) return b;
+  if (b.startsWith(a)) return b;
+  if (a.startsWith(b)) return a;
+  if (a.endsWith(b)) return a;
+  const tail = a.slice(-Math.min(48, a.length));
+  if (tail && b.startsWith(tail)) return `${a.slice(0, a.length - tail.length)}${b}`.trim();
+  return `${a} ${b}`.trim();
 }
 
 function extractModelReplyText(response: unknown, fallback: string): string {
@@ -152,6 +344,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const endOfMessagesRef = useRef<HTMLDivElement>(null);
   const lastShownModelKeyRef = useRef('');
   const lastSpokenMessageIdRef = useRef<string>(''); // NEW: Track exactly which message was spoken
+  const minimaxSpeakAbortRef = useRef<AbortController | null>(null);
+  const minimaxAudioRef = useRef<HTMLAudioElement | null>(null);
+  const minimaxObjectUrlRef = useRef<string | null>(null);
   const floatIdleHideTimerRef = useRef<number | null>(null);
   const floatAfterFadeTimerRef = useRef<number | null>(null);
   const clearFloatingDisplayTimers = useCallback(() => {
@@ -165,6 +360,12 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     }
   }, []);
   const [voiceBlockingMessage, setVoiceBlockingMessage] = useState<string | null>(null);
+  /** 改 session 音色后强制重渲染（sessionStorage 本身不触发 React） */
+  const [, setLiveVoiceRevision] = useState(0);
+  const [liveVoiceSwitchHint, setLiveVoiceSwitchHint] = useState('');
+  const liveVoiceSwitchHintTimerRef = useRef<number | null>(null);
+  /** 下拉切换 Live 音色：断开后仍保持语音底栏/隐藏文字区，直至自动重连成功或用户退出 */
+  const [liveVoiceHandoff, setLiveVoiceHandoff] = useState(false);
   const onSpeechValueRef = useRef(onSpeechValue);
   useEffect(() => {
     onSpeechValueRef.current = onSpeechValue;
@@ -174,6 +375,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const [isVoiceMode, setIsVoiceMode] = useState(false);
   const [isVoiceConnecting, setIsVoiceConnecting] = useState(false);
   const liveSessionRef = useRef<any>(null);
+  /** 每次 stop / 新 connect 递增；用于忽略旧 Live 会话晚到的 onclose（否则会清掉 liveVoiceHandoff 导致界面跳回文字） */
+  const liveVoiceSessionGenRef = useRef(0);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -184,6 +387,18 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const nextPlayTimeRef = useRef<number>(0);
   const audioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  /** Live：已结束的每轮「识别 + 字幕」完整保留 */
+  const [liveCaptionTurns, setLiveCaptionTurns] = useState<LiveCaptionTurn[]>([]);
+  /** 当前轮流式累积（合并片段，避免只显示最后几个词） */
+  const [liveStreamUser, setLiveStreamUser] = useState('');
+  const [liveStreamAi, setLiveStreamAi] = useState('');
+  /** 与上面对照：识别译文 / 字幕中文 */
+  const [liveStreamUserAlt, setLiveStreamUserAlt] = useState('');
+  const [liveStreamAiZh, setLiveStreamAiZh] = useState('');
+  const liveStreamUserRef = useRef('');
+  const liveStreamAiRef = useRef('');
+  const liveStreamTranslateTimerRef = useRef<number | null>(null);
+  const liveStreamTransSeqRef = useRef(0);
   const lastChatErrorRef = useRef<unknown>(null);
 
   const isAIActive = isTyping || isSpeaking || isVoiceConnecting;
@@ -191,6 +406,19 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
+
+  const liveCaptionLatest = useMemo(() => {
+    if (!liveCaptionTurns.length) return null;
+    return liveCaptionTurns[liveCaptionTurns.length - 1]!;
+  }, [liveCaptionTurns]);
+
+  const albumSessions = useMemo(
+    () =>
+      sessions
+        .filter((s) => s.etchedToAlbum === true && (s.messages?.length ?? 0) > 0)
+        .sort((a, b) => (b.etchedAt ?? 0) - (a.etchedAt ?? 0)),
+    [sessions],
+  );
 
   useImperativeHandle(
     ref,
@@ -339,16 +567,40 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     if (messageKey === lastShownModelKeyRef.current) return () => {};
     lastShownModelKeyRef.current = messageKey;
 
+    const stopMinimaxPlayback = () => {
+      minimaxSpeakAbortRef.current?.abort();
+      minimaxSpeakAbortRef.current = null;
+      if (minimaxAudioRef.current) {
+        try {
+          minimaxAudioRef.current.pause();
+        } catch {
+          /* ignore */
+        }
+        minimaxAudioRef.current = null;
+      }
+      if (minimaxObjectUrlRef.current) {
+        try {
+          URL.revokeObjectURL(minimaxObjectUrlRef.current);
+        } catch {
+          /* ignore */
+        }
+        minimaxObjectUrlRef.current = null;
+      }
+    };
+
     const speakNewMessage = (text: string, messageId: string) => {
       if (!isAutoSpeak) return;
-      if (typeof window.speechSynthesis === 'undefined') return;
       if (lastSpokenMessageIdRef.current === messageId) return;
       lastSpokenMessageIdRef.current = messageId;
       window.speechSynthesis.cancel();
+      stopMinimaxPlayback();
 
       const speakSlice = text.length > MAX_TTS_CHARS ? `${text.slice(0, MAX_TTS_CHARS)}…` : text;
+      const ttsPlain = stripTextForTts(speakSlice);
+      if (!ttsPlain) return;
 
       const applyVoiceAndSpeak = () => {
+        if (typeof window.speechSynthesis === 'undefined') return;
         try {
           const utterance = new SpeechSynthesisUtterance(speakSlice);
           const voices = window.speechSynthesis.getVoices();
@@ -365,6 +617,64 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         }
       };
 
+      if (getMinimaxApiKey()) {
+        const ac = new AbortController();
+        minimaxSpeakAbortRef.current = ac;
+        void (async () => {
+          try {
+            const blob = await synthesizeMinimaxTtsToMp3Blob({
+              text: ttsPlain,
+              signal: ac.signal,
+              voiceId: readStoredMinimaxClonedVoiceId()?.trim() || undefined,
+            });
+            if (ac.signal.aborted) return;
+            if (lastSpokenMessageIdRef.current !== messageId) return;
+            const objectUrl = URL.createObjectURL(blob);
+            minimaxObjectUrlRef.current = objectUrl;
+            const audio = new Audio(objectUrl);
+            minimaxAudioRef.current = audio;
+            audio.onplay = () => onSpeechValueRef.current?.(0.38);
+            audio.onended = () => {
+              onSpeechValueRef.current?.(0);
+              if (minimaxObjectUrlRef.current) {
+                URL.revokeObjectURL(minimaxObjectUrlRef.current);
+                minimaxObjectUrlRef.current = null;
+              }
+              minimaxAudioRef.current = null;
+            };
+            audio.onerror = () => {
+              onSpeechValueRef.current?.(0);
+              if (minimaxObjectUrlRef.current) {
+                URL.revokeObjectURL(minimaxObjectUrlRef.current);
+                minimaxObjectUrlRef.current = null;
+              }
+              minimaxAudioRef.current = null;
+            };
+            await audio.play();
+          } catch (e) {
+            if (ac.signal.aborted) return;
+            console.warn('MiniMax TTS failed, falling back to speechSynthesis', e);
+            stopMinimaxPlayback();
+            const voices = window.speechSynthesis?.getVoices() ?? [];
+            if (voices.length === 0) {
+              voicesListener = () => {
+                cleanupSpeechVoicesWait();
+                applyVoiceAndSpeak();
+              };
+              window.speechSynthesis.addEventListener('voiceschanged', voicesListener);
+              voicesFallbackId = window.setTimeout(() => {
+                cleanupSpeechVoicesWait();
+                applyVoiceAndSpeak();
+              }, 600);
+            } else {
+              applyVoiceAndSpeak();
+            }
+          }
+        })();
+        return;
+      }
+
+      if (typeof window.speechSynthesis === 'undefined') return;
       const voices = window.speechSynthesis.getVoices();
       if (voices.length === 0) {
         voicesListener = () => {
@@ -420,6 +730,24 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       clearFloatingDisplayTimers();
       cleanupSpeechVoicesWait();
       window.speechSynthesis.cancel();
+      minimaxSpeakAbortRef.current?.abort();
+      minimaxSpeakAbortRef.current = null;
+      if (minimaxAudioRef.current) {
+        try {
+          minimaxAudioRef.current.pause();
+        } catch {
+          /* ignore */
+        }
+        minimaxAudioRef.current = null;
+      }
+      if (minimaxObjectUrlRef.current) {
+        try {
+          URL.revokeObjectURL(minimaxObjectUrlRef.current);
+        } catch {
+          /* ignore */
+        }
+        minimaxObjectUrlRef.current = null;
+      }
     };
   }, [latestModelTurnKey, activeSession, isAutoSpeak, language, clearFloatingDisplayTimers]);
 
@@ -442,6 +770,69 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       }
     }
     throw lastError || new Error('No available text model');
+  };
+
+  /** Live 字幕中英对照：单行译文，失败则返回空串 */
+  const translateCaptionLine = async (text: string, target: 'zh' | 'en'): Promise<string> => {
+    const t = text.trim();
+    if (!t) return '';
+    const prompt =
+      target === 'zh'
+        ? `将下列文字译为简明、口语化的简体中文。只输出译文，不要引号或解释。\n\n${t}`
+        : `Translate the following into natural English. Output ONLY the translation, no quotes or notes.\n\n${t}`;
+    try {
+      const r = await generateWithFallback([{ text: prompt }], {
+        systemInstruction:
+          'You are a professional translator. Output only the translation text, nothing else.',
+      });
+      const out = (r as { text?: string })?.text?.trim() || '';
+      return out.length > 1200 ? `${out.slice(0, 1200)}…` : out;
+    } catch (e) {
+      console.warn('Live caption bilingual translate failed', e);
+      return '';
+    }
+  };
+
+  const fillBilingualForTurn = async (id: string, user: string, ai: string) => {
+    const u = user.trim();
+    const a = ai.trim();
+    let userAlt = '';
+    if (u) {
+      userAlt = await translateCaptionLine(u, containsHanScript(u) ? 'en' : 'zh');
+    }
+    let aiAlt = '';
+    if (a) {
+      aiAlt = await translateCaptionLine(a, containsHanScript(a) ? 'en' : 'zh');
+    }
+    setLiveCaptionTurns((rows) => rows.map((r) => (r.id === id ? { ...r, userAlt, aiAlt } : r)));
+  };
+
+  /** 当前轮字幕流式更新后防抖翻译，避免每包都打模型 */
+  const scheduleLiveStreamCaptionTranslate = () => {
+    if (liveStreamTranslateTimerRef.current != null) {
+      window.clearTimeout(liveStreamTranslateTimerRef.current);
+    }
+    const scheduleToken = liveStreamTransSeqRef.current;
+    liveStreamTranslateTimerRef.current = window.setTimeout(() => {
+      liveStreamTranslateTimerRef.current = null;
+      void (async () => {
+        if (scheduleToken !== liveStreamTransSeqRef.current) return;
+        const u = liveStreamUserRef.current.trim();
+        const a = liveStreamAiRef.current.trim();
+        let userAlt = '';
+        if (u.length > 2) {
+          userAlt = await translateCaptionLine(u, containsHanScript(u) ? 'en' : 'zh');
+        }
+        if (scheduleToken !== liveStreamTransSeqRef.current) return;
+        setLiveStreamUserAlt(userAlt);
+        let aiAlt = '';
+        if (a.length > 2) {
+          aiAlt = await translateCaptionLine(a, containsHanScript(a) ? 'en' : 'zh');
+        }
+        if (scheduleToken !== liveStreamTransSeqRef.current) return;
+        setLiveStreamAiZh(aiAlt);
+      })();
+    }, 520);
   };
 
   const saveSessions = (newSessions: ChatSession[]) => {
@@ -488,6 +879,20 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 3. 引导提问：在回复的结尾，提出一个有启发性的问题，引导用户进一步探索自己的想法或感受。
 4. 简洁明了：保持回复在2-3句话以内。
 5. 禁止废话：不要道歉，不要表现得像个机器人助手。`;
+  };
+
+  /**
+   * 麦克风 Live：口语回复须与界面语言一致（中文界面 → 自然普通话；英文界面 → 自然英语）。
+   */
+  const getLiveVoiceSystemInstruction = () => {
+    if (language === 'zh') {
+      return `使用中文（普通话口语）。用户可能夹杂英文词，你仍须用自然、流畅的中文语音和文字回复，不要用翻译腔或书面语堆砌。
+语速平稳、从容，不要赶。每次回答约 2～3 句短话，最后提一个简短、有启发性的追问。
+不要用「作为人工智能」「这张图像显示了」等套话，不要多余道歉。`;
+    }
+    return `You are a warm, insightful friend. The user may speak Chinese or other languages, but you must reply ONLY in natural English for both speech and any text. Use idiomatic English—do not translate literally from Chinese in a stiff way.
+Speak at a calm, moderate pace (not rushed). Keep each reply to about 2–3 short sentences, then ask one brief, thoughtful follow-up question.
+Do not use meta-AI phrases ("As an AI"), and avoid unnecessary apologies.`;
   };
 
   const generateTheme = async (messages: ChatMessage[]) => {
@@ -722,8 +1127,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     
     const source = audioCtx.createBufferSource();
     source.buffer = audioBuffer;
+    source.playbackRate.value = LIVE_AUDIO_PLAYBACK_RATE;
     source.connect(audioCtx.destination);
-    
+
     const playTime = Math.max(audioCtx.currentTime, nextPlayTimeRef.current);
     source.start(playTime);
     nextPlayTimeRef.current = playTime + audioBuffer.duration;
@@ -740,11 +1146,26 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     };
   };
 
-  const stopVoiceMode = () => {
+  const stopVoiceMode = (opts?: { preserveLiveVoiceHandoff?: boolean }) => {
+    liveVoiceSessionGenRef.current += 1;
     voiceLiveReadyRef.current = false;
     setIsVoiceMode(false);
     setIsVoiceConnecting(false);
     setIsSpeaking(false);
+    setLiveCaptionTurns([]);
+    liveStreamUserRef.current = '';
+    liveStreamAiRef.current = '';
+    setLiveStreamUser('');
+    setLiveStreamAi('');
+    setLiveStreamUserAlt('');
+    setLiveStreamAiZh('');
+    liveStreamTransSeqRef.current += 1;
+    if (liveStreamTranslateTimerRef.current != null) {
+      window.clearTimeout(liveStreamTranslateTimerRef.current);
+      liveStreamTranslateTimerRef.current = null;
+    }
+    /** 新 AudioContext 的 currentTime 从 0 起；若沿用旧会话的 nextPlayTime，会把首段音频排到「几秒后」导致听不见 */
+    nextPlayTimeRef.current = 0;
 
     if (processorMuteRef.current) {
       try {
@@ -755,8 +1176,17 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       processorMuteRef.current = null;
     }
     if (processorRef.current) {
+      try {
+        processorRef.current.onaudioprocess = null;
+      } catch {
+        /* ignore */
+      }
+      try {
         processorRef.current.disconnect();
-        processorRef.current = null;
+      } catch {
+        /* ignore */
+      }
+      processorRef.current = null;
     }
     if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach(t => t.stop());
@@ -774,6 +1204,30 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
          } catch(e) {}
          liveSessionRef.current = null;
     }
+    if (!opts?.preserveLiveVoiceHandoff) {
+      setLiveVoiceHandoff(false);
+    }
+  };
+
+  /** 将当前流式识别/字幕固化为一条历史（一轮完整对话） */
+  const flushLiveCaptionTurn = () => {
+    const u = liveStreamUserRef.current.trim();
+    const a = liveStreamAiRef.current.trim();
+    if (!u && !a) return;
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    setLiveCaptionTurns((rows) => [...rows, { id, user: u, userAlt: '', ai: a, aiAlt: '' }]);
+    liveStreamUserRef.current = '';
+    liveStreamAiRef.current = '';
+    setLiveStreamUser('');
+    setLiveStreamAi('');
+    setLiveStreamUserAlt('');
+    setLiveStreamAiZh('');
+    if (liveStreamTranslateTimerRef.current != null) {
+      window.clearTimeout(liveStreamTranslateTimerRef.current);
+      liveStreamTranslateTimerRef.current = null;
+    }
+    liveStreamTransSeqRef.current += 1;
+    void fillBilingualForTurn(id, u, a);
   };
 
   const startVoiceMode = async () => {
@@ -796,6 +1250,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
      if (!window.isSecureContext) {
        window.clearTimeout(timeoutId);
        setIsVoiceConnecting(false);
+       setLiveVoiceHandoff(false);
        setVoiceBlockingMessage(
          language === 'zh'
            ? '请在需要「安全网页」的环境使用语音（HTTPS 或本机 localhost）。由于手机打开 http://192.168… 等局域网地址时，浏览器通常会锁定麦克风权限，语音模式无法工作。请改用 HTTPS 部署本页面，或继续使用下方文字对话。'
@@ -807,6 +1262,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
      if (!navigator.mediaDevices?.getUserMedia) {
        window.clearTimeout(timeoutId);
        setIsVoiceConnecting(false);
+       setLiveVoiceHandoff(false);
        setVoiceBlockingMessage(
          language === 'zh' ? '当前浏览器不支持麦克风（无 getUserMedia）。' : 'This browser does not support the microphone API.'
        );
@@ -855,11 +1311,17 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
          processor.connect(muteOut);
          muteOut.connect(audioContext.destination);
 
-        // Start connecting to Live API
-        const sessionPromise = ai.live.connect({
-            model: "gemini-2.0-flash", // Use the GA/Stable preview model
-            callbacks: {
-              onopen: async () => {
+        // Gemini Multimodal Live（必须用 Live 专用模型名，否则常表现为「已连接但无回声」）
+        let session: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
+        let lastLiveConnectError: unknown = null;
+        for (const liveModel of liveVoiceModelCandidates()) {
+          try {
+            const connectGen = ++liveVoiceSessionGenRef.current;
+            const sessionPromise = ai.live.connect({
+              model: liveModel,
+              callbacks: {
+                onopen: async () => {
+                  if (connectGen !== liveVoiceSessionGenRef.current) return;
                   try {
                     await audioContext.resume();
                   } catch {
@@ -869,46 +1331,140 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
                   window.clearTimeout(timeoutId);
                   setIsVoiceConnecting(false);
                   setIsVoiceMode(true);
-                  console.log('Live voice connection established');
-               },
-               onmessage: async (message: LiveServerMessage) => {
-                   if (message.serverContent?.interrupted) {
-                       audioSourcesRef.current.forEach(s => s.stop());
-                       audioSourcesRef.current = [];
-                       nextPlayTimeRef.current = audioContextRef.current?.currentTime || 0;
-                       setIsSpeaking(false);
-                   }
-                   
-                   const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-                   if (base64Audio) {
-                       handleAudioOutput(base64Audio);
-                   }
-               },
-               onclose: (e: any) => {
-                  console.log("Live voice connection closed", e);
+                  setLiveVoiceHandoff(false);
+                  if (liveVoiceSwitchHintTimerRef.current != null) {
+                    window.clearTimeout(liveVoiceSwitchHintTimerRef.current);
+                    liveVoiceSwitchHintTimerRef.current = null;
+                  }
+                  setLiveVoiceSwitchHint('');
+                  const vn = resolveGeminiLiveSpeechVoiceName();
+                  console.info('[Live voice] model:', liveModel, '| voiceName:', vn);
+                },
+                onmessage: async (message: LiveServerMessage) => {
+                  if (connectGen !== liveVoiceSessionGenRef.current) return;
+                  if (message.serverContent?.interrupted) {
+                    audioSourcesRef.current.forEach((s) => s.stop());
+                    audioSourcesRef.current = [];
+                    nextPlayTimeRef.current = audioContextRef.current?.currentTime || 0;
+                    setIsSpeaking(false);
+                    const u = liveStreamUserRef.current.trim();
+                    const a = liveStreamAiRef.current.trim();
+                    if (u || a) {
+                      const intrId = `${Date.now()}-intr-${Math.random().toString(36).slice(2, 7)}`;
+                      const suffix = language === 'zh' ? '（已打断）' : ' (interrupted)';
+                      const aiText = a ? `${a}${suffix}` : '';
+                      setLiveCaptionTurns((rows) => [
+                        ...rows,
+                        { id: intrId, user: u, userAlt: '', ai: aiText, aiAlt: '' },
+                      ]);
+                      void fillBilingualForTurn(intrId, u, aiText);
+                    }
+                    liveStreamUserRef.current = '';
+                    liveStreamAiRef.current = '';
+                    setLiveStreamUser('');
+                    setLiveStreamAi('');
+                    setLiveStreamUserAlt('');
+                    setLiveStreamAiZh('');
+                    liveStreamTransSeqRef.current += 1;
+                    if (liveStreamTranslateTimerRef.current != null) {
+                      window.clearTimeout(liveStreamTranslateTimerRef.current);
+                      liveStreamTranslateTimerRef.current = null;
+                    }
+                  }
+
+                  const { ai: capAi, user: capUser } = pickLiveCaptionTexts(message);
+                  if (capUser) {
+                    const prevU = liveStreamUserRef.current;
+                    const aiAcc = liveStreamAiRef.current.trim();
+                    const newU = capUser.trim();
+                    const likelyNewUserTurn =
+                      prevU.length > 8 &&
+                      newU.length > 0 &&
+                      newU.length < prevU.length * 0.55 &&
+                      !prevU.startsWith(newU) &&
+                      !newU.startsWith(prevU.slice(0, Math.min(14, prevU.length))) &&
+                      aiAcc.length > 10;
+                    if (likelyNewUserTurn) {
+                      flushLiveCaptionTurn();
+                    }
+                    const merged = mergeStreamingTranscript(liveStreamUserRef.current, capUser);
+                    liveStreamUserRef.current = merged;
+                    setLiveStreamUser(merged);
+                  }
+                  if (capAi) {
+                    const merged = mergeStreamingTranscript(liveStreamAiRef.current, capAi);
+                    liveStreamAiRef.current = merged;
+                    setLiveStreamAi(merged);
+                  }
+                  if (capUser || capAi) {
+                    scheduleLiveStreamCaptionTranslate();
+                  }
+
+                  if (isLiveModelTurnComplete(message)) {
+                    flushLiveCaptionTurn();
+                  }
+
+                  const base64Audio = pickLiveAudioBase64FromMessage(message);
+                  if (base64Audio) {
+                    handleAudioOutput(base64Audio);
+                  }
+                },
+                onclose: (e: unknown) => {
+                  if (connectGen !== liveVoiceSessionGenRef.current) return;
+                  console.log('[Live voice] closed', e);
+                  const ev = e as CloseEvent;
+                  if (ev?.code === 1008 && typeof ev?.reason === 'string' && ev.reason.length > 0) {
+                    setVoiceBlockingMessage(
+                      language === 'zh'
+                        ? `语音模型不可用：${ev.reason.slice(0, 280)}`
+                        : `Live model unavailable: ${ev.reason.slice(0, 280)}`,
+                    );
+                  }
                   stopVoiceMode();
-               },
-               onerror: (e: any) => {
-                  console.error("Live voice connection error", e);
+                },
+                onerror: (e: unknown) => {
+                  if (connectGen !== liveVoiceSessionGenRef.current) return;
+                  console.error('[Live voice] error', e);
                   setVoiceBlockingMessage(
-                    language === 'zh' ? '语音连接错误，请检查网络或 API 权限' : 'Voice connection error. Check network or API permissions.'
+                    language === 'zh'
+                      ? '语音连接错误，请检查网络、API Key 或模型是否支持 Live。'
+                      : 'Voice connection error. Check network, API key, or Live model support.',
                   );
                   stopVoiceMode();
-               }
-            },
-             config: {
-               responseModalities: [Modality.AUDIO],
-               speechConfig: {
-                 voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
-               },
-               systemInstruction: getSystemInstruction(),
-             }
-         });
-         
-         const session = await sessionPromise;
-         liveSessionRef.current = session;
+                },
+              },
+              config: {
+                responseModalities: [Modality.AUDIO],
+                temperature: 0.78,
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: {
+                      voiceName: resolveGeminiLiveSpeechVoiceName(),
+                    },
+                  },
+                },
+                /** 语音转写：依赖服务端字段；若模型不支持则对应区域可能为空 */
+                outputAudioTranscription: {},
+                inputAudioTranscription: {},
+                systemInstruction: getLiveVoiceSystemInstruction(),
+              },
+            });
+            session = await sessionPromise;
+            console.log('[Live voice] session ready:', liveModel);
+            break;
+          } catch (e) {
+            lastLiveConnectError = e;
+            console.warn('[Live voice] connect failed for', liveModel, e);
+          }
+        }
+
+        if (!session) {
+          throw lastLiveConnectError || new Error('LIVE_MODEL_CONNECT_FAILED');
+        }
+        liveSessionRef.current = session;
 
          processor.onaudioprocess = (e) => {
+           if (!voiceLiveReadyRef.current || liveSessionRef.current !== session) return;
            const inputData = e.inputBuffer.getChannelData(0);
            const pcm16 = new Int16Array(inputData.length);
            for (let i = 0; i < inputData.length; i++) {
@@ -925,17 +1481,26 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
            }
            const base64Data = btoa(binaryString);
 
-           session.sendRealtimeInput({
-             audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
-           });
+           try {
+             if (!voiceLiveReadyRef.current || liveSessionRef.current !== session) return;
+             session.sendRealtimeInput({
+               audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
+             });
+           } catch {
+             /* WebSocket 已关闭时 ScriptProcessor 仍可能多跑一帧，忽略即可 */
+           }
          };
 
          if (currentImageDataUrl) {
            const match = currentImageDataUrl.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
            if (match) {
-             session.sendRealtimeInput({
-               video: { data: match[2], mimeType: match[1] },
-             });
+             try {
+               session.sendRealtimeInput({
+                 video: { data: match[2], mimeType: match[1] },
+               });
+             } catch {
+               /* 连接已断开时忽略 */
+             }
            }
          }
 
@@ -952,7 +1517,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   };
 
   const toggleVoiceMode = () => {
-     if (isVoiceMode || isVoiceConnecting) {
+     if (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) {
          stopVoiceMode();
      } else {
          startVoiceMode();
@@ -967,10 +1532,48 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
      };
   }, [clearFloatingDisplayTimers]);
 
+  const hideLiveTextChatUi = isVoiceMode || isVoiceConnecting || liveVoiceHandoff;
+
+  const liveUserCaptionMain = liveStreamUser.trim() || liveCaptionLatest?.user || '';
+  const liveUserCaptionAlt = liveStreamUser.trim() ? liveStreamUserAlt : liveCaptionLatest?.userAlt || '';
+  const liveAiCaptionMain = liveStreamAi.trim() || liveCaptionLatest?.ai || '';
+  const liveAiCaptionAlt = liveStreamAi.trim() ? liveStreamAiZh : liveCaptionLatest?.aiAlt || '';
+  const showLiveCaptionPair = !!(
+    liveUserCaptionMain ||
+    liveUserCaptionAlt ||
+    liveAiCaptionMain ||
+    liveAiCaptionAlt
+  );
+
   if (!isOpen) return null;
 
   return (
     <>
+    {currentImageDataUrl && albumSessions.length > 0 && (
+      <div
+        className="pointer-events-auto fixed left-[max(0.45rem,env(safe-area-inset-left))] top-[max(20dvh,calc(env(safe-area-inset-top)+5.5rem))] z-[38] flex max-h-[min(40dvh,18rem)] w-9 flex-col items-center gap-2 overflow-y-auto overscroll-contain py-1 [-ms-overflow-style:none] [scrollbar-width:none] md:left-[max(1rem,env(safe-area-inset-left))] md:gap-2.5 [&::-webkit-scrollbar]:hidden"
+        role="list"
+        aria-label={language === 'zh' ? '回忆册：已镌刻的对话' : 'Memory album: saved conversations'}
+      >
+        {albumSessions.slice(0, 28).map((s, idx) => (
+          <button
+            key={s.id}
+            type="button"
+            title={s.theme}
+            onClick={() => {
+              setActiveSessionId(s.id);
+              setShowSavePreview(false);
+            }}
+            className={`relative z-0 h-2 w-2 shrink-0 rounded-full border transition-transform duration-300 hover:z-[1] hover:scale-[1.45] active:scale-95 md:h-2.5 md:w-2.5 ${
+              activeSessionId === s.id
+                ? 'border-rose-400/80 bg-rose-200/40 shadow-[0_0_14px_rgba(251,113,133,0.5)]'
+                : 'border-zinc-500/45 bg-zinc-200/20 shadow-[0_0_10px_rgba(228,228,231,0.22)] hover:border-zinc-400/70 hover:bg-zinc-100/35'
+            } ${idx % 5 === 0 ? 'motion-safe:animate-pulse' : ''}`}
+            aria-label={s.theme}
+          />
+        ))}
+      </div>
+    )}
     <div
       className={`pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-end pb-[calc(env(safe-area-inset-bottom)+4.75rem)] transition-opacity duration-700 max-md:pb-[calc(env(safe-area-inset-bottom)+5rem)] md:pb-[calc(env(safe-area-inset-bottom)+6.25rem)] ${isOpen ? 'opacity-100' : 'opacity-0'}`}
     >
@@ -1018,6 +1621,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       {/* 仅输入区与气泡列表接收触摸，避免整块底栏挡住底栏胶囊键 */}
       <div className="pointer-events-none flex w-full max-w-xl flex-col gap-2 px-3 sm:px-4">
 
+        {!hideLiveTextChatUi && (
+        <>
         {/* Body */}
         <div
           className="no-scrollbar pointer-events-auto relative max-h-[16dvh] touch-pan-y overflow-y-auto p-1 sm:max-h-[36vh] md:max-h-[44vh]"
@@ -1043,16 +1648,102 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
                 <div ref={endOfMessagesRef} />
              </div>
         </div>
+        </>
+        )}
 
         {/* Input Area */}
         <div className="pointer-events-auto transition-all duration-500">
-           {isVoiceMode && (
-             <div className="mb-1.5 flex min-h-[38px] items-center justify-between rounded-full border border-zinc-800 bg-zinc-900/60 px-4 py-2 backdrop-blur-md md:mb-2 md:min-h-[48px] md:px-6 md:py-3">
-                <div className="flex min-w-0 items-center gap-2 md:gap-3">
-                   <div className={`h-2 w-2 shrink-0 rounded-full md:h-2 ${isSpeaking ? 'animate-pulse bg-zinc-200' : 'bg-zinc-500'}`} />
-                   <span className="truncate text-[10px] font-medium uppercase tracking-wider text-zinc-400 md:text-xs md:tracking-widest">
-                     {isVoiceConnecting ? (language === 'zh' ? '连接中...' : 'Connecting...') : (isSpeaking ? (language === 'zh' ? '回响中...' : 'Echoing...') : (language === 'zh' ? '倾听中...' : 'Listening...'))}
+           {(isVoiceMode || isVoiceConnecting || liveVoiceHandoff) && (
+             <div className="mx-auto mb-1.5 flex w-full max-w-md flex-col gap-1.5">
+             <div className="flex min-h-[38px] items-center justify-between gap-2 rounded-full border border-zinc-800 bg-zinc-900/60 px-4 py-2 backdrop-blur-md md:min-h-[48px] md:px-6 md:py-3">
+                <div className="flex min-w-0 flex-1 flex-col gap-1">
+                <div className="flex min-w-0 flex-wrap items-center gap-2 md:gap-3">
+                   <div
+                     className={`h-2 w-2 shrink-0 rounded-full md:h-2 ${
+                       isSpeaking ? 'animate-pulse bg-zinc-200' : liveVoiceHandoff && !isVoiceMode && !isVoiceConnecting ? 'animate-pulse bg-amber-400/90' : 'bg-zinc-500'
+                     }`}
+                   />
+                   <span className="truncate font-serif text-[10px] font-medium italic tracking-wider text-zinc-400 md:text-xs md:tracking-widest">
+                     {isVoiceConnecting
+                       ? language === 'zh'
+                         ? '连接中...'
+                         : 'Connecting...'
+                       : liveVoiceHandoff && !isVoiceMode
+                         ? language === 'zh'
+                           ? '切换音色中…'
+                           : 'Switching voice…'
+                         : isSpeaking
+                           ? language === 'zh'
+                             ? '回响中...'
+                             : 'Echoing...'
+                           : language === 'zh'
+                             ? '倾听中...'
+                             : 'Listening...'}
                    </span>
+                   <label className="flex min-w-0 max-w-full items-center gap-1">
+                     <span className="sr-only">{language === 'zh' ? '选择语音音色' : 'Choose voice'}</span>
+                     <select
+                       value={getLiveVoiceSelectControlValue()}
+                       onChange={(e) => {
+                         const v = e.target.value;
+                         if (v === '__DEFAULT__') {
+                           try {
+                             sessionStorage.removeItem(LIVE_VOICE_SESSION_STORAGE_KEY);
+                           } catch {
+                             /* ignore */
+                           }
+                         } else {
+                           try {
+                             sessionStorage.setItem(LIVE_VOICE_SESSION_STORAGE_KEY, v);
+                           } catch {
+                             /* ignore */
+                           }
+                         }
+                         const effective = v === '__DEFAULT__' ? getGeminiLiveSpeechVoiceNameFromEnvOnly() : v;
+                         console.info('[Live voice] pick:', v === '__DEFAULT__' ? 'default(.env)' : v, '| effective:', effective);
+                         setLiveVoiceRevision((n) => n + 1);
+                         if (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) {
+                           if (liveVoiceSwitchHintTimerRef.current != null) {
+                             window.clearTimeout(liveVoiceSwitchHintTimerRef.current);
+                             liveVoiceSwitchHintTimerRef.current = null;
+                           }
+                           setLiveVoiceSwitchHint('');
+                           setLiveVoiceHandoff(true);
+                           stopVoiceMode({ preserveLiveVoiceHandoff: true });
+                           queueMicrotask(() => {
+                             void startVoiceMode();
+                           });
+                         }
+                       }}
+                       className="max-w-[min(72vw,14rem)] truncate rounded-md border border-zinc-700 bg-zinc-950/90 px-1.5 py-1 font-serif text-[9px] italic text-zinc-300 md:max-w-[16rem] md:text-[10px]"
+                       title={
+                         language === 'zh'
+                           ? '仅 Google Live 公布的预设名有效；可改 .env 的 GEMINI_LIVE_SPEECH_VOICE_NAME。文字朗读走 MiniMax，与这里无关。'
+                           : 'Only Google Live preset voice names work; set GEMINI_LIVE_SPEECH_VOICE_NAME in .env. Text read-aloud uses MiniMax.'
+                       }
+                     >
+                       <option value="__DEFAULT__">
+                         {language === 'zh'
+                           ? `默认（.env：${getGeminiLiveSpeechVoiceNameFromEnvOnly()}）`
+                           : `Default (.env: ${getGeminiLiveSpeechVoiceNameFromEnvOnly()})`}
+                       </option>
+                       {liveVoiceOptionsForSelect().map((name) => (
+                         <option key={name} value={name}>
+                           {name}
+                         </option>
+                       ))}
+                     </select>
+                   </label>
+                   <span
+                     className="max-w-[min(40vw,7rem)] truncate font-serif text-[9px] italic normal-case tracking-normal text-zinc-600 md:max-w-[10rem] md:text-[10px]"
+                     title={language === 'zh' ? '当前语音（Google 预设名）' : 'Current voice (Google preset name)'}
+                   >
+                     {resolveGeminiLiveSpeechVoiceName()}
+                   </span>
+                </div>
+                {liveVoiceSwitchHint ? (
+                  <p className="w-full pl-1 font-serif text-[10px] italic leading-snug text-amber-200/90 md:text-[11px]">{liveVoiceSwitchHint}</p>
+                ) : null}
                 </div>
                 <button
                   type="button"
@@ -1063,9 +1754,69 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
                   <MicOff className="h-[18px] w-[18px] md:h-[18px] md:w-[18px]" strokeWidth={1.5} />
                 </button>
              </div>
+             {showLiveCaptionPair && (
+               <div
+                 className="flex w-full flex-col gap-2 font-serif italic"
+                 aria-live="polite"
+                 aria-relevant="additions text"
+               >
+                 {/* 仅当前一轮：流式优先，落句后显示该轮完整字幕；多轮在本地会话/回忆册查看 */}
+                 <div className="flex h-36 flex-col overflow-hidden rounded-xl border border-zinc-800/90 bg-zinc-950/90 shadow-inner backdrop-blur-md md:h-[9.5rem]">
+                   <div className="shrink-0 border-b border-zinc-800/60 px-2.5 py-1 text-[9px] font-medium uppercase tracking-wider text-zinc-500 not-italic">
+                     {language === 'zh' ? '我说' : 'You'}
+                   </div>
+                   <div className="flex min-h-0 flex-1 flex-col justify-center overflow-hidden px-2.5 py-2 text-right">
+                     {liveUserCaptionMain ? (
+                       <p className="line-clamp-6 break-words text-[11px] leading-snug text-zinc-200/95 md:text-[12px]">
+                         {liveUserCaptionMain}
+                       </p>
+                     ) : null}
+                     {liveUserCaptionAlt ? (
+                       <p className="mt-1 line-clamp-3 break-words text-[10px] leading-snug text-zinc-500 md:text-[11px]">
+                         {liveUserCaptionAlt}
+                       </p>
+                     ) : null}
+                   </div>
+                 </div>
+                 <div className="flex h-36 flex-col overflow-hidden rounded-xl border border-zinc-800/90 bg-zinc-950/90 shadow-inner backdrop-blur-md md:h-[9.5rem]">
+                   <div className="shrink-0 border-b border-zinc-800/60 px-2.5 py-1 text-[9px] font-medium uppercase tracking-wider text-zinc-500 not-italic">
+                     {language === 'zh' ? 'AI 回复' : 'AI reply'}
+                   </div>
+                   <div className="flex min-h-0 flex-1 flex-col justify-center overflow-hidden px-2.5 py-2 text-left">
+                     {liveAiCaptionMain ? (
+                       <p className="line-clamp-6 break-words text-[12px] leading-relaxed tracking-wide text-zinc-50/95 md:text-[13px]">
+                         {liveAiCaptionMain}
+                       </p>
+                     ) : null}
+                     {liveAiCaptionAlt ? (
+                       <p className="mt-1 line-clamp-3 break-words text-[11px] leading-relaxed text-zinc-400 md:text-[12px]">
+                         {liveAiCaptionAlt}
+                       </p>
+                     ) : null}
+                   </div>
+                 </div>
+               </div>
+             )}
+             </div>
            )}
-          <div className="relative mx-auto flex w-full max-w-md items-center">
-             <div className="relative flex min-h-[42px] flex-1 items-center overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/60 shadow-lg backdrop-blur-md transition-colors focus-within:border-zinc-600 md:min-h-[48px] md:rounded-2xl md:shadow-xl">
+          {hideLiveTextChatUi ? (
+            <div className="relative mx-auto flex w-full max-w-md justify-center py-1.5">
+              <button
+                type="button"
+                onClick={toggleVoiceMode}
+                className={`flex h-12 min-h-[48px] w-12 min-w-[48px] shrink-0 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/60 text-zinc-500 shadow-lg backdrop-blur-md transition-colors hover:text-zinc-200 touch-manipulation active:bg-zinc-800/50 md:h-14 md:min-h-[56px] md:w-14 md:min-w-[56px] ${isVoiceMode || isVoiceConnecting || liveVoiceHandoff ? 'border-rose-900/50 text-rose-500' : ''}`}
+                aria-label={language === 'zh' ? '语音对话' : 'Voice'}
+              >
+                {isVoiceConnecting || liveVoiceHandoff ? (
+                  <Loader2 strokeWidth={1.5} className="h-[22px] w-[22px] animate-spin md:h-6 md:w-6" />
+                ) : (
+                  <Mic strokeWidth={1.5} className="h-[22px] w-[22px] md:h-6 md:w-6" />
+                )}
+              </button>
+            </div>
+          ) : (
+            <div className="relative mx-auto flex w-full max-w-md items-center">
+              <div className="relative flex min-h-[42px] flex-1 items-center overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/60 shadow-lg backdrop-blur-md transition-colors focus-within:border-zinc-600 md:min-h-[48px] md:rounded-2xl md:shadow-xl">
                 <textarea
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
@@ -1074,17 +1825,21 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
                   inputMode="text"
                   autoComplete="off"
                   autoCorrect="on"
-                  placeholder={isVoiceMode ? (language === 'zh' ? '说话或打字…' : 'Speak or type…') : (language === 'zh' ? '对话…' : 'Message…')}
+                  placeholder={language === 'zh' ? '对话…' : 'Message…'}
                   className="max-h-24 min-h-[42px] w-full flex-1 resize-none bg-transparent px-3 py-2 text-[15px] leading-snug text-zinc-200 placeholder:text-zinc-600 focus:outline-none md:max-h-28 md:min-h-[48px] md:px-4 md:py-3 md:text-sm md:leading-normal"
                   rows={1}
                 />
                 <button
                   type="button"
                   onClick={toggleVoiceMode}
-                  className={`flex h-10 min-h-[40px] w-10 min-w-[40px] shrink-0 items-center justify-center text-zinc-500 transition-colors hover:text-zinc-200 touch-manipulation active:bg-zinc-800/50 md:h-11 md:min-h-[44px] md:w-11 md:min-w-[44px] ${isVoiceMode || isVoiceConnecting ? 'text-rose-500' : ''}`}
+                  className={`flex h-10 min-h-[40px] w-10 min-w-[40px] shrink-0 items-center justify-center text-zinc-500 transition-colors hover:text-zinc-200 touch-manipulation active:bg-zinc-800/50 md:h-11 md:min-h-[44px] md:w-11 md:min-w-[44px] ${isVoiceMode || isVoiceConnecting || liveVoiceHandoff ? 'text-rose-500' : ''}`}
                   aria-label={language === 'zh' ? '语音对话' : 'Voice'}
                 >
-                  {isVoiceConnecting ? <Loader2 strokeWidth={1.5} className="h-[18px] w-[18px] animate-spin md:h-5 md:w-5" /> : <Mic strokeWidth={1.5} className="h-[18px] w-[18px] md:h-5 md:w-5" />}
+                  {isVoiceConnecting || liveVoiceHandoff ? (
+                    <Loader2 strokeWidth={1.5} className="h-[18px] w-[18px] animate-spin md:h-5 md:w-5" />
+                  ) : (
+                    <Mic strokeWidth={1.5} className="h-[18px] w-[18px] md:h-5 md:w-5" />
+                  )}
                 </button>
                 <button
                   type="button"
@@ -1095,8 +1850,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
                 >
                   <Send strokeWidth={1.5} className="h-5 w-5 md:h-[22px] md:w-[22px]" />
                 </button>
-             </div>
-          </div>
+              </div>
+            </div>
+          )}
         </div>
 
       </div>
@@ -1185,7 +1941,16 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
                  type="button"
                  onClick={() => {
                     setShowSavePreview(false);
-                    // Minimal success toast could be added here
+                    if (!activeSession) return;
+                    const etched: ChatSession = {
+                      ...activeSession,
+                      etchedToAlbum: true,
+                      etchedAt: Date.now(),
+                      updatedAt: Date.now(),
+                    };
+                    const next = sessions.map((s) => (s.id === etched.id ? etched : s));
+                    setSessions(next);
+                    saveSessions(next);
                  }}
                  className="min-h-[52px] flex-1 rounded-2xl border border-zinc-800 bg-zinc-100/5 py-4 text-xs font-bold uppercase tracking-[0.28em] text-zinc-200 shadow-xl shadow-black/20 transition-all hover:border-zinc-700 hover:bg-zinc-100/10 touch-manipulation md:min-h-[48px] md:py-5 md:text-[10px] md:tracking-[0.3em]"
                >
