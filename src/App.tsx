@@ -3,22 +3,30 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Settings2, X, RefreshCw, Dna, Languages, Save, FileAudio, Loader2 } from 'lucide-react';
-import ChatOverlay, { type ChatOverlayHandle } from './components/ChatOverlay';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Settings2, X, Dna, Languages, FileAudio, Loader2, History, Mic } from 'lucide-react';
+import ChatOverlay, { type ChatOverlayHandle, type ConversationMode } from './components/ChatOverlay';
 import {
+  ensureMinimaxVoicePersistenceLoaded,
   getAudioFileDurationSec,
   getMinimaxApiKey,
   MINIMAX_CLONE_MAX_DURATION_SEC,
   MINIMAX_CLONE_MIN_DURATION_SEC,
   MINIMAX_CLONED_VOICE_STORAGE_KEY,
+  MINIMAX_VOICE_PROFILES_KEY,
   newClonedVoiceId,
   readStoredMinimaxClonedVoiceId,
+  readVoiceProfiles,
+  removeVoiceProfile,
   requestMinimaxVoiceClone,
+  setActiveVoiceProfileId,
   uploadMinimaxVoiceCloneSource,
+  upsertVoiceProfile,
   validateCloneAudioFile,
-  writeStoredMinimaxClonedVoiceId,
 } from './minimaxVoiceClone';
+
+/** 尽早从 session 镜像恢复 localStorage，避免首屏 state 读到空 */
+ensureMinimaxVoicePersistenceLoaded();
 
 
 // --- Particle Engine ---
@@ -217,9 +225,12 @@ class Particle {
     const r = Math.max(0.35, this.size * 0.5 * sizeBreath);
     const cx = this.x + r;
     const cy = this.y + r;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fill();
+    // 方形微粒（非圆点），略旋转打破网格感
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(this.drift + time * 0.00022 * (0.55 + this.edgeFactor * 0.35));
+    ctx.fillRect(-r, -r, r * 2, r * 2);
+    ctx.restore();
   }
 }
 
@@ -391,6 +402,10 @@ export default function App() {
   const [isAudioReactive, setIsAudioReactive] = useState(false);
   const [isAutoSpeak, setIsAutoSpeak] = useState(() => localStorage.getItem('subconscious_auto_speak') === 'true');
 
+  /** 上传图像并选定：Live 语音 ↔ 文字+复刻音色，两条链路互斥 */
+  const [conversationMode, setConversationMode] = useState<ConversationMode | null>(null);
+  const [voiceProfileTick, setVoiceProfileTick] = useState(0);
+
   const cloneAudioInputRef = useRef<HTMLInputElement>(null);
   const cloneJobAbortRef = useRef<AbortController | null>(null);
   const [clonedMinimaxVoiceId, setClonedMinimaxVoiceId] = useState<string | null>(() => readStoredMinimaxClonedVoiceId());
@@ -405,21 +420,37 @@ export default function App() {
 
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
-      if (e.key === null || e.key === MINIMAX_CLONED_VOICE_STORAGE_KEY) {
+      if (
+        e.key === null ||
+        e.key === MINIMAX_CLONED_VOICE_STORAGE_KEY ||
+        e.key === MINIMAX_VOICE_PROFILES_KEY
+      ) {
         setClonedMinimaxVoiceId(readStoredMinimaxClonedVoiceId());
+        setVoiceProfileTick((n) => n + 1);
       }
     };
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);
   }, []);
 
+  /** 与 localStorage 一致；若仅有「当前选中 id」也会并入列表，避免界面空白 */
+  const voiceListForUi = useMemo(() => {
+    const base = readVoiceProfiles();
+    const active = clonedMinimaxVoiceId?.trim();
+    if (active && !base.some((p) => p.voiceId === active)) {
+      return [{ voiceId: active, createdAt: Date.now() }, ...base];
+    }
+    return base;
+  }, [voiceProfileTick, clonedMinimaxVoiceId]);
+
   const clearClonedMinimaxVoice = useCallback(() => {
     cloneJobAbortRef.current?.abort();
     cloneJobAbortRef.current = null;
-    writeStoredMinimaxClonedVoiceId(null);
+    setActiveVoiceProfileId(null);
     setClonedMinimaxVoiceId(null);
+    setVoiceProfileTick((n) => n + 1);
     setCloneVoiceHint(
-      language === 'zh' ? '已恢复为默认音色（环境变量或系统内置）。' : 'Reverted to default voice (env or built-in).',
+      language === 'zh' ? '已改用默认音色（.env 的 MINIMAX_VOICE_ID 或内置）。' : 'Using default voice from MINIMAX_VOICE_ID or built-in.',
     );
   }, [language]);
 
@@ -475,8 +506,9 @@ export default function App() {
           });
           if (ac.signal.aborted) return;
 
-          writeStoredMinimaxClonedVoiceId(voiceId);
+          upsertVoiceProfile(voiceId);
           setClonedMinimaxVoiceId(voiceId);
+          setVoiceProfileTick((n) => n + 1);
           const idTail = voiceId.length > 14 ? `${voiceId.slice(0, 10)}…${voiceId.slice(-6)}` : voiceId;
           setCloneVoiceHint(
             language === 'zh'
@@ -779,6 +811,7 @@ export default function App() {
     reader.onload = (event) => {
       const result = event.target?.result as string;
       setImageSrc(result);
+      setConversationMode(null);
       
       const img = new Image();
       img.src = result;
@@ -792,6 +825,7 @@ export default function App() {
 
   const handleClearImage = () => {
     setImageSrc(null);
+    setConversationMode(null);
     imageRef.current = null;
     particlesRef.current = [];
     edgeMeshIndexRef.current = emptyEdgeMesh();
@@ -835,7 +869,7 @@ export default function App() {
         z-0  画布交互
         z-10 首次上传引导；z-42 首页语言键叠在其上
         z-30 对话层（大面积 pointer-events-none，见 ChatOverlay）
-        z-42 顶栏语言/设置、底栏「消散重置 / 保存对话」（始终可点）
+        z-42 顶栏语言/设置（始终可点）；消散重置 / 保存对话在对话条右侧
         z-49 设置抽屉遮罩（仅窄屏）
         z-50 设置面板
       */}
@@ -898,11 +932,11 @@ export default function App() {
         </>
       )}
 
-      {/* z-30 对话 UI — 低于顶栏/底栏，避免挡住按钮 */}
+      {/* z-30 对话 UI — 低于顶栏，避免挡住按钮 */}
       <ChatOverlay
         ref={chatOverlayRef}
         currentImageDataUrl={imageSrc}
-        isOpen={!!imageSrc}
+        isOpen={!!imageSrc && conversationMode !== null}
         onClose={() => {}}
         language={language}
         onToggleLanguage={() => setLanguage((l) => (l === 'zh' ? 'en' : 'zh'))}
@@ -910,12 +944,56 @@ export default function App() {
         onSpeechValue={handleSpeechValue}
         isAutoSpeak={isAutoSpeak}
         setIsAutoSpeak={setIsAutoSpeak}
+        conversationMode={(conversationMode ?? 'live') as ConversationMode}
+        onDissolveReset={handleDissolveReset}
+        onOpenSavePreview={() => chatOverlayRef.current?.openSavePreview()}
       />
+
+      {imageSrc && conversationMode === null && (
+        <div className="fixed inset-0 z-[44] flex flex-col items-center justify-center bg-[#050505]/88 px-6 backdrop-blur-md pointer-events-auto pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+          <p className="mb-8 max-w-sm text-center text-[13px] leading-relaxed text-zinc-400 md:text-sm">
+            {language === 'zh' ? '选择对话方式。' : 'Choose a mode.'}
+          </p>
+          <div className="flex w-full max-w-md flex-col gap-4 md:flex-row md:gap-5">
+            <button
+              type="button"
+              onClick={() => setConversationMode('live')}
+              className="flex min-h-[52px] flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-zinc-700 bg-zinc-900/70 px-6 py-4 text-zinc-200 shadow-lg transition-colors hover:border-rose-500/40 hover:bg-zinc-800/80 touch-manipulation active:scale-[0.99]"
+            >
+              <Mic className="h-6 w-6 text-rose-400/90" strokeWidth={1.5} />
+              <span className="text-[11px] font-medium uppercase tracking-[0.22em]">
+                {language === 'zh' ? 'Live 语音对话' : 'Live voice'}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setConversationMode('text_clone')}
+              className="flex min-h-[52px] flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-zinc-700 bg-zinc-900/70 px-6 py-4 text-zinc-200 shadow-lg transition-colors hover:border-zinc-500 hover:bg-zinc-800/80 touch-manipulation active:scale-[0.99]"
+            >
+              <FileAudio className="h-6 w-6 text-zinc-400" strokeWidth={1.5} />
+              <span className="text-[11px] font-medium uppercase tracking-[0.22em]">
+                {language === 'zh' ? '文字 + 复刻音色' : 'Text + clone'}
+              </span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {imageSrc && (
         <>
-          {/* z-42 顶栏：语言 + 设置 */}
+          {/* z-42 顶栏：历史 + 语言 + 设置 */}
           <div className="fixed right-[max(0.5rem,env(safe-area-inset-right))] top-[max(0.5rem,env(safe-area-inset-top))] z-[42] flex items-center gap-1 pointer-events-auto touch-manipulation md:gap-2">
+            {conversationMode !== null && (
+              <button
+                type="button"
+                onClick={() => chatOverlayRef.current?.openHistory()}
+                className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg px-2 text-zinc-500 opacity-90 transition-colors hover:text-zinc-200 active:bg-zinc-900/80 md:min-h-[44px] md:min-w-[44px] md:rounded-xl md:px-3"
+                title={language === 'zh' ? '历史对话' : 'Chat history'}
+                aria-label={language === 'zh' ? '历史对话' : 'Chat history'}
+              >
+                <History className="h-[18px] w-[18px] md:h-5 md:w-5" strokeWidth={1.5} />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setLanguage((l) => (l === 'zh' ? 'en' : 'zh'))}
@@ -943,26 +1021,6 @@ export default function App() {
             </button>
           </div>
 
-          {/* z-42 底栏：消散重置 + 保存对话（同式胶囊键） */}
-          <div className="fixed bottom-[max(0.6rem,env(safe-area-inset-bottom))] left-1/2 z-[42] flex -translate-x-1/2 flex-row items-stretch gap-2 md:gap-3 pointer-events-auto">
-            <button
-              type="button"
-              onClick={handleDissolveReset}
-              className="flex min-h-[38px] items-center justify-center gap-2 rounded-full border border-zinc-800 bg-zinc-950/85 px-6 py-2 text-[11px] font-medium uppercase tracking-[0.18em] text-zinc-400 shadow-md backdrop-blur-md transition-colors hover:bg-zinc-900 hover:text-zinc-200 md:min-h-[48px] md:gap-3 md:px-8 md:py-3 md:text-sm md:tracking-widest md:shadow-lg touch-manipulation active:scale-[0.98]"
-            >
-              <RefreshCw className="h-3.5 w-3.5 md:h-[18px] md:w-[18px]" />
-              <span>{language === 'zh' ? '消散重置' : 'Dissolve Reset'}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => chatOverlayRef.current?.openSavePreview()}
-              className="flex min-h-[38px] items-center justify-center gap-2 rounded-full border border-zinc-800 bg-zinc-950/85 px-6 py-2 text-[11px] font-medium uppercase tracking-[0.18em] text-zinc-400 shadow-md backdrop-blur-md transition-colors hover:bg-zinc-900 hover:text-zinc-200 md:min-h-[48px] md:gap-3 md:px-8 md:py-3 md:text-sm md:tracking-widest md:shadow-lg touch-manipulation active:scale-[0.98]"
-            >
-              <Save className="h-3.5 w-3.5 md:h-[18px] md:w-[18px]" />
-              <span>{language === 'zh' ? '保存对话' : 'SAVE CHAT'}</span>
-            </button>
-          </div>
-
           {/* 窄屏设置遮罩 */}
           {showSettings && (
             <button
@@ -983,6 +1041,23 @@ export default function App() {
           >
         <div className="flex flex-col gap-5 md:gap-8">
           
+          {conversationMode !== null ? (
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 py-2.5 md:py-3">
+              <div className="text-[10px] font-medium uppercase tracking-wider text-zinc-600">
+                {language === 'zh' ? '当前链路' : 'Mode'}
+              </div>
+              <p className="mt-1 text-[12px] leading-snug text-zinc-300">
+                {conversationMode === 'live'
+                  ? language === 'zh'
+                    ? 'Live 语音'
+                    : 'Live voice'
+                  : language === 'zh'
+                    ? '文字 + 复刻朗读'
+                    : 'Text + read-aloud'}
+              </p>
+            </div>
+          ) : null}
+
           <div className="space-y-2 md:space-y-4">
             <div className="text-xs font-medium uppercase tracking-widest text-zinc-500">
               {language === 'zh' ? 'AI 角色名称' : 'AI Character Name'}
@@ -999,17 +1074,18 @@ export default function App() {
             />
           </div>
 
-          <div className="space-y-2 md:space-y-4">
+          <div className={`space-y-2 md:space-y-4 ${conversationMode === 'live' ? 'opacity-45' : ''}`}>
             <div className="flex items-center justify-between text-xs font-medium uppercase tracking-widest text-zinc-500">
               <span>{language === 'zh' ? '朗读回复' : 'READ RESPONSES'}</span>
               <button 
                 type="button"
+                disabled={conversationMode === 'live'}
                 onClick={() => {
                   const newVal = !isAutoSpeak;
                   setIsAutoSpeak(newVal);
                   localStorage.setItem('subconscious_auto_speak', String(newVal));
                 }}
-                className={`relative h-7 w-12 shrink-0 rounded-full transition-colors md:h-5 md:w-10 ${isAutoSpeak ? 'bg-rose-600' : 'bg-zinc-800'}`}
+                className={`relative h-7 w-12 shrink-0 rounded-full transition-colors md:h-5 md:w-10 ${isAutoSpeak ? 'bg-rose-600' : 'bg-zinc-800'} ${conversationMode === 'live' ? 'cursor-not-allowed' : ''}`}
               >
                 <span
                   className={`absolute left-0.5 top-0.5 block h-6 w-6 rounded-full bg-white shadow transition-transform duration-200 ease-out md:left-1 md:top-1 md:h-3 md:w-3 ${isAutoSpeak ? 'translate-x-5 md:translate-x-5' : 'translate-x-0'}`}
@@ -1030,6 +1106,67 @@ export default function App() {
                 className="hidden"
                 onChange={handleCloneAudioSelected}
               />
+              {voiceListForUi.length > 0 ? (
+                <div className="space-y-1.5">
+                  <div className="text-[10px] font-medium uppercase tracking-wider text-zinc-600">
+                    {language === 'zh' ? '已保存音色（可切换）' : 'Saved voices'}
+                  </div>
+                  <select
+                    title={language === 'zh' ? '朗读使用的音色' : 'Voice used for read-aloud'}
+                    className="min-h-[40px] w-full rounded-lg border border-zinc-800 bg-zinc-900 px-2 py-2 text-[11px] text-zinc-200 md:min-h-0"
+                    value={clonedMinimaxVoiceId ?? ''}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setActiveVoiceProfileId(v || null);
+                      setClonedMinimaxVoiceId(readStoredMinimaxClonedVoiceId());
+                      setVoiceProfileTick((n) => n + 1);
+                    }}
+                  >
+                    <option value="">
+                      {language === 'zh' ? '默认（.env MINIMAX_VOICE_ID）' : 'Default (MINIMAX_VOICE_ID)'}
+                    </option>
+                    {voiceListForUi.map((p) => (
+                      <option key={p.voiceId} value={p.voiceId}>
+                        {(p.label || p.voiceId).length > 40
+                          ? `${(p.label || p.voiceId).slice(0, 38)}…`
+                          : p.label || p.voiceId}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="flex flex-wrap gap-2">
+                    {clonedMinimaxVoiceId ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          removeVoiceProfile(clonedMinimaxVoiceId);
+                          setClonedMinimaxVoiceId(readStoredMinimaxClonedVoiceId());
+                          setVoiceProfileTick((n) => n + 1);
+                          setCloneVoiceHint(
+                            language === 'zh' ? '已从列表移除。' : 'Removed from list.',
+                          );
+                        }}
+                        className="inline-flex min-h-[36px] items-center gap-1 rounded-lg border border-zinc-800 px-2 py-1.5 text-[10px] text-zinc-500 transition-colors hover:border-zinc-600 hover:text-zinc-300"
+                      >
+                        <X className="h-3 w-3" strokeWidth={2} />
+                        {language === 'zh' ? '删除所选档案' : 'Delete selected'}
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={clearClonedMinimaxVoice}
+                      className="inline-flex min-h-[36px] items-center gap-1 rounded-lg border border-zinc-800 px-2 py-1.5 text-[10px] text-zinc-500 transition-colors hover:border-zinc-600 hover:text-zinc-300"
+                    >
+                      {language === 'zh' ? '改用默认音色' : 'Use default voice'}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-[11px] leading-snug text-zinc-600 md:text-[10px]">
+                  {language === 'zh'
+                    ? '当前没有已保存的复刻音色 ID。请固定用同一地址打开（例如始终用 http://localhost:5173，不要混用 127.0.0.1 或局域网 IP）；无痕模式、清除站点数据或换浏览器会清空。刷新同一标签页一般会保留，若仍丢失请检查是否上述原因。'
+                    : 'No saved voice IDs. Always use the same URL (e.g. stick to http://localhost:5173); mixing 127.0.0.1 or LAN IP uses separate storage. Private mode or clearing site data wipes data. Same-tab refresh should keep voices.'}
+                </p>
+              )}
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
@@ -1044,16 +1181,6 @@ export default function App() {
                   )}
                   {language === 'zh' ? '上传录音复刻音色' : 'Upload audio to clone'}
                 </button>
-                {clonedMinimaxVoiceId ? (
-                  <button
-                    type="button"
-                    onClick={clearClonedMinimaxVoice}
-                    className="inline-flex min-h-[40px] items-center gap-1 rounded-lg border border-zinc-800 px-2 py-2 text-[10px] text-zinc-500 transition-colors hover:border-zinc-600 hover:text-zinc-300 md:min-h-0 md:py-1.5 md:text-[11px]"
-                  >
-                    <X className="h-3 w-3" strokeWidth={2} />
-                    {language === 'zh' ? '清除复刻' : 'Clear clone'}
-                  </button>
-                ) : null}
               </div>
               {cloneVoiceHint ? (
                 <p className="text-[11px] leading-snug text-zinc-400 md:text-[10px]">{cloneVoiceHint}</p>

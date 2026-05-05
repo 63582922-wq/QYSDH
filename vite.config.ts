@@ -63,7 +63,14 @@ export default defineConfig(({mode}) => {
   const minimaxProxyTarget =
     normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_API_BASE')).replace(/\/$/, '') ||
     'https://api.minimax.io';
+  const minimaxChatBaseSan = normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_CHAT_API_BASE'));
+  const minimaxChatProxyTarget =
+    minimaxChatBaseSan.replace(/\/$/, '') || minimaxProxyTarget;
+  const separateChatProxy =
+    minimaxChatBaseSan !== '' &&
+    minimaxChatProxyTarget.replace(/\/$/, '') !== minimaxProxyTarget.replace(/\/$/, '');
   const minimaxKeySan = normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_API_KEY'));
+  const minimaxChatKeySan = normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_CHAT_API_KEY'));
   if (mode === 'development') {
     const keyHint = !minimaxKeySan
       ? '（未配置）'
@@ -72,8 +79,16 @@ export default defineConfig(({mode}) => {
         : minimaxKeySan.startsWith('sk-api-')
           ? 'sk-api-…（开放平台形态，可试语音）'
           : `${minimaxKeySan.slice(0, 8)}…`;
-    console.info(`[vite] MiniMax 代理 → ${minimaxProxyTarget}`);
+    console.info(`[vite] MiniMax 语音代理 → ${minimaxProxyTarget}`);
     console.info(`[vite] MINIMAX_API_KEY 形态: ${keyHint}`);
+    if (separateChatProxy) {
+      console.info(`[vite] MiniMax 对话代理 → ${minimaxChatProxyTarget}（路径 /minimax-chat-api）`);
+    } else {
+      console.info('[vite] MiniMax 对话与语音共用 /minimax-api');
+    }
+    if (minimaxChatKeySan) {
+      console.info(`[vite] 已配置 MINIMAX_CHAT_API_KEY（克隆模式图文对话）`);
+    }
   }
   return {
     root,
@@ -99,6 +114,15 @@ export default defineConfig(({mode}) => {
       'process.env.MINIMAX_TTS_SPEED': JSON.stringify(
         normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_TTS_SPEED')),
       ),
+      'process.env.MINIMAX_CHAT_API_KEY': JSON.stringify(minimaxChatKeySan),
+      'process.env.MINIMAX_CHAT_API_BASE': JSON.stringify(minimaxChatBaseSan),
+      'process.env.MINIMAX_CHAT_MODEL': JSON.stringify(
+        normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_CHAT_MODEL')),
+      ),
+      'process.env.MINIMAX_CHAT_VISION_MODEL': JSON.stringify(
+        normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_CHAT_VISION_MODEL')),
+      ),
+      'process.env.MINIMAX_CHAT_SEPARATE_PROXY': JSON.stringify(separateChatProxy ? '1' : ''),
     },
     resolve: {
       alias: {
@@ -107,7 +131,7 @@ export default defineConfig(({mode}) => {
     },
     server: {
       host: true,
-      port: 3000,
+      port: 5173,
       strictPort: false,
       open: true,
       proxy: {
@@ -117,6 +141,15 @@ export default defineConfig(({mode}) => {
           changeOrigin: true,
           rewrite: (p) => p.replace(/^\/minimax-api/, ''),
         },
+        ...(separateChatProxy
+          ? {
+              '/minimax-chat-api': {
+                target: minimaxChatProxyTarget,
+                changeOrigin: true,
+                rewrite: (p) => p.replace(/^\/minimax-chat-api/, ''),
+              },
+            }
+          : {}),
       },
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.

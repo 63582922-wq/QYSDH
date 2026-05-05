@@ -61,8 +61,27 @@ export function withMinimaxGroupQuery(url: string): string {
   return `${url}${sep}GroupId=${encodeURIComponent(gid)}`;
 }
 
-export function stripTextForTts(text: string): string {
+/**
+ * 去掉模型泄露的思考链 / 推理块（含 `<think>`、`<think>`、`<reasoning>` 等），避免界面与 TTS 读出「内心戏」。
+ */
+export function stripReasoningArtifacts(text: string): string {
   let s = typeof text === 'string' ? text : String(text ?? '');
+  const blocks: RegExp[] = [
+    /<think\b[^>]*>[\s\S]*?<\/think>/gi,
+    /<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi,
+    /<reasoning\b[^>]*>[\s\S]*?<\/reasoning>/gi,
+    /<thought\b[^>]*>[\s\S]*?<\/thought>/gi,
+    /<redacted_thinking\b[^>]*>[\s\S]*?<\/redacted_thinking>/gi,
+    /<redacted_reasoning\b[^>]*>[\s\S]*?<\/redacted_reasoning>/gi,
+    /<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi,
+  ];
+  for (const re of blocks) s = s.replace(re, '');
+  s = s.replace(/```(?:think|thinking|reasoning|analysis)[\s\S]*?```/gi, '');
+  return s.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+export function stripTextForTts(text: string): string {
+  let s = stripReasoningArtifacts(typeof text === 'string' ? text : String(text ?? ''));
   s = s.replace(/\*\*([^*]+)\*\*/g, '$1');
   s = s.replace(/\*([^*]+)\*/g, '$1');
   s = s.replace(/`{1,3}[^`]*`{1,3}/g, ' ');

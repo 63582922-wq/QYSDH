@@ -32,6 +32,148 @@ export const MINIMAX_CLONE_MAX_FILE_BYTES = 20 * 1024 * 1024;
 /** 与 ChatOverlay / App 设置共用，供自动朗读 MiniMax TTS 读取 */
 export const MINIMAX_CLONED_VOICE_STORAGE_KEY = 'subconscious_minimax_cloned_voice_id';
 
+/** 多条复刻音色档案（可选昵称），当前朗读使用的 id 仍由上面 key 指向「选中」项 */
+export const MINIMAX_VOICE_PROFILES_KEY = 'subconscious_minimax_voice_profiles';
+
+/** 与 localStorage 同步；同一标签页内刷新可回填（部分 WebView / 分区存储异常时略稳一点） */
+const MINIMAX_VOICE_SESSION_BACKUP_ID = 'subconscious_minimax_voice_id_sess_bak';
+const MINIMAX_VOICE_SESSION_BACKUP_PROFILES = 'subconscious_minimax_voice_profiles_sess_bak';
+
+function mirrorMinimaxVoiceToSession(): void {
+  try {
+    const id = localStorage.getItem(MINIMAX_CLONED_VOICE_STORAGE_KEY);
+    const prof = localStorage.getItem(MINIMAX_VOICE_PROFILES_KEY);
+    if (id != null && String(id).trim() !== '') {
+      sessionStorage.setItem(MINIMAX_VOICE_SESSION_BACKUP_ID, String(id).trim());
+    } else {
+      sessionStorage.removeItem(MINIMAX_VOICE_SESSION_BACKUP_ID);
+    }
+    if (prof != null && String(prof).trim() !== '') {
+      sessionStorage.setItem(MINIMAX_VOICE_SESSION_BACKUP_PROFILES, prof);
+    } else {
+      sessionStorage.removeItem(MINIMAX_VOICE_SESSION_BACKUP_PROFILES);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 页面加载时调用：若 localStorage 被清空但同标签页 session 仍有镜像，则写回 localStorage。
+ * @returns 是否发生了恢复（便于 UI 刷新状态）
+ */
+export function ensureMinimaxVoicePersistenceLoaded(): boolean {
+  try {
+    const hasId = !!localStorage.getItem(MINIMAX_CLONED_VOICE_STORAGE_KEY)?.trim();
+    const hasProf = !!localStorage.getItem(MINIMAX_VOICE_PROFILES_KEY)?.trim();
+    if (hasId || hasProf) {
+      mirrorMinimaxVoiceToSession();
+      return false;
+    }
+    const bid = sessionStorage.getItem(MINIMAX_VOICE_SESSION_BACKUP_ID)?.trim();
+    const bprof = sessionStorage.getItem(MINIMAX_VOICE_SESSION_BACKUP_PROFILES);
+    if (!bid && (!bprof || String(bprof).trim() === '')) return false;
+    if (bid) localStorage.setItem(MINIMAX_CLONED_VOICE_STORAGE_KEY, bid);
+    if (bprof && String(bprof).trim() !== '') {
+      localStorage.setItem(MINIMAX_VOICE_PROFILES_KEY, bprof);
+    }
+    mirrorMinimaxVoiceToSession();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export type MinimaxVoiceProfile = {
+  voiceId: string;
+  /** 用户备注，默认可为空 */
+  label?: string;
+  createdAt: number;
+};
+
+function parseProfiles(raw: string | null): MinimaxVoiceProfile[] {
+  if (!raw) return [];
+  try {
+    const p = JSON.parse(raw);
+    if (!Array.isArray(p)) return [];
+    return p
+      .filter((x: unknown) => x && typeof (x as MinimaxVoiceProfile).voiceId === 'string')
+      .map((x: MinimaxVoiceProfile) => ({
+        voiceId: String(x.voiceId).trim(),
+        label: typeof x.label === 'string' ? x.label.trim() || undefined : undefined,
+        createdAt: typeof x.createdAt === 'number' ? x.createdAt : Date.now(),
+      }))
+      .filter((x) => x.voiceId.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/** 已保存的复刻音色列表（最新在前）；会自动把旧版「仅单 id」迁移进列表 */
+export function readVoiceProfiles(): MinimaxVoiceProfile[] {
+  let list = parseProfiles(
+    (() => {
+      try {
+        return localStorage.getItem(MINIMAX_VOICE_PROFILES_KEY);
+      } catch {
+        return null;
+      }
+    })(),
+  );
+  try {
+    const legacy = localStorage.getItem(MINIMAX_CLONED_VOICE_STORAGE_KEY)?.trim();
+    if (legacy && !list.some((p) => p.voiceId === legacy)) {
+      list = [{ voiceId: legacy, createdAt: Date.now() }, ...list];
+    }
+  } catch {
+    /* ignore */
+  }
+  const seen = new Set<string>();
+  return list.filter((p) => {
+    if (seen.has(p.voiceId)) return false;
+    seen.add(p.voiceId);
+    return true;
+  });
+}
+
+export function writeVoiceProfiles(profiles: MinimaxVoiceProfile[]): void {
+  try {
+    localStorage.setItem(MINIMAX_VOICE_PROFILES_KEY, JSON.stringify(profiles));
+    mirrorMinimaxVoiceToSession();
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 复刻成功或手动导入：写入列表并设为当前朗读音色 */
+export function upsertVoiceProfile(voiceId: string, label?: string): void {
+  const id = voiceId.trim();
+  if (!id) return;
+  const rest = readVoiceProfiles().filter((p) => p.voiceId !== id);
+  const next: MinimaxVoiceProfile[] = [
+    { voiceId: id, label: label?.trim() || undefined, createdAt: Date.now() },
+    ...rest,
+  ];
+  writeVoiceProfiles(next);
+  writeStoredMinimaxClonedVoiceId(id);
+}
+
+/** 从列表移除；若删掉的是当前选中，则自动选中列表第一条或清空（退回 env 默认音色） */
+export function removeVoiceProfile(voiceId: string): void {
+  const id = voiceId.trim();
+  if (!id) return;
+  const next = readVoiceProfiles().filter((p) => p.voiceId !== id);
+  writeVoiceProfiles(next);
+  const active = readStoredMinimaxClonedVoiceId()?.trim();
+  if (active === id) {
+    writeStoredMinimaxClonedVoiceId(next[0]?.voiceId ?? null);
+  }
+}
+
+export function setActiveVoiceProfileId(voiceId: string | null): void {
+  writeStoredMinimaxClonedVoiceId(voiceId?.trim() || null);
+}
+
 export function readStoredMinimaxClonedVoiceId(): string | null {
   try {
     return localStorage.getItem(MINIMAX_CLONED_VOICE_STORAGE_KEY);
@@ -45,6 +187,7 @@ export function writeStoredMinimaxClonedVoiceId(id: string | null): void {
     const t = id?.trim();
     if (t) localStorage.setItem(MINIMAX_CLONED_VOICE_STORAGE_KEY, t);
     else localStorage.removeItem(MINIMAX_CLONED_VOICE_STORAGE_KEY);
+    mirrorMinimaxVoiceToSession();
   } catch {
     /* ignore */
   }
