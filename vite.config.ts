@@ -46,12 +46,22 @@ function minimaxFromEnvFiles(mode: string, envDir: string): Partial<Record<strin
   return merged;
 }
 
+/**
+ * 合并策略：非空优先。
+ * 避免仓库里 `.env` / `.env.production` 写了空的 `MINIMAX_API_KEY=` 时，盖掉 Render 等在构建期注入的 process.env。
+ */
 function pickMinimax(
   fileVars: Partial<Record<string, string>>,
   env: Record<string, string>,
   key: string,
 ): string | undefined {
-  return fileVars[key] !== undefined ? fileVars[key] : env[key];
+  const fromFile = fileVars[key];
+  const fromEnv = env[key];
+  const fileNorm = fromFile !== undefined ? normalizeMinimaxEnvValue(fromFile) : '';
+  const envNorm = fromEnv !== undefined ? normalizeMinimaxEnvValue(fromEnv) : '';
+  if (fileNorm !== '') return fromFile;
+  if (envNorm !== '') return fromEnv;
+  return fromFile !== undefined ? fromFile : fromEnv;
 }
 
 export default defineConfig(({mode}) => {

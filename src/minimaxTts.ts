@@ -7,9 +7,16 @@ import { normalizeMinimaxEnvValue } from './minimaxEnv';
 export { normalizeMinimaxEnvValue };
 
 export function getMinimaxApiKey(): string {
-  return normalizeMinimaxEnvValue(
+  const main = normalizeMinimaxEnvValue(
     typeof process !== 'undefined' && typeof process.env.MINIMAX_API_KEY === 'string'
       ? process.env.MINIMAX_API_KEY
+      : undefined,
+  );
+  if (main) return main;
+  /** 与 minimaxChat 对称：有人只配了 MINIMAX_CHAT_API_KEY 时，语音/复刻仍可用同一把钥匙 */
+  return normalizeMinimaxEnvValue(
+    typeof process !== 'undefined' && typeof process.env.MINIMAX_CHAT_API_KEY === 'string'
+      ? process.env.MINIMAX_CHAT_API_KEY
       : undefined,
   );
 }

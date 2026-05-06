@@ -1110,8 +1110,8 @@ export default function App() {
               {!getMinimaxApiKey() ? (
                 <p className="rounded-lg border border-amber-900/40 bg-amber-950/30 px-2.5 py-2 text-[11px] leading-snug text-amber-100/90 md:text-[10px]">
                   {language === 'zh'
-                    ? '未检测到 MINIMAX_API_KEY：无法调用上传/复刻接口。请在部署环境（如 Render）配置后重新构建；本地写入 .env.local 后重启 dev。'
-                    : 'MINIMAX_API_KEY is missing. Configure it in your host (e.g. Render) and redeploy, or .env.local for dev.'}
+                    ? '未检测到 MINIMAX_API_KEY（或与 MINIMAX_CHAT_API_KEY 均为空）：Key 在打包时写入前端。请确认构建阶段能读到该变量；若仓库 .env 里有空的 MINIMAX_API_KEY= 会盖掉托管注入，请删空行或更新部署。'
+                    : 'MINIMAX_API_KEY (and MINIMAX_CHAT_API_KEY) are empty in the built bundle. Ensure the build sees the var; an empty MINIMAX_API_KEY= in a committed .env can override host env—remove it and redeploy.'}
                 </p>
               ) : null}
               <input
