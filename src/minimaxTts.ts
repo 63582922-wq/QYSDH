@@ -2,17 +2,22 @@
 
 /** MiniMax 文本转语音（T2A HTTP），与官方 OpenAPI 一致：https://platform.minimax.io/docs/api-reference/speech-t2a-http */
 
+import { runtimeMinimaxTrimmed } from './appClientEnv';
 import { normalizeMinimaxEnvValue } from './minimaxEnv';
 
 export { normalizeMinimaxEnvValue };
 
 export function getMinimaxApiKey(): string {
+  const rtMain = runtimeMinimaxTrimmed('MINIMAX_API_KEY');
+  if (rtMain) return rtMain;
   const main = normalizeMinimaxEnvValue(
     typeof process !== 'undefined' && typeof process.env.MINIMAX_API_KEY === 'string'
       ? process.env.MINIMAX_API_KEY
       : undefined,
   );
   if (main) return main;
+  const rtChat = runtimeMinimaxTrimmed('MINIMAX_CHAT_API_KEY');
+  if (rtChat) return rtChat;
   /** 与 minimaxChat 对称：有人只配了 MINIMAX_CHAT_API_KEY 时，语音/复刻仍可用同一把钥匙 */
   return normalizeMinimaxEnvValue(
     typeof process !== 'undefined' && typeof process.env.MINIMAX_CHAT_API_KEY === 'string'
@@ -47,10 +52,12 @@ export interface MinimaxT2aResponse {
 }
 
 export function resolveMinimaxApiRoot(): string {
+  const rtBase = runtimeMinimaxTrimmed('MINIMAX_API_BASE');
   const fromEnv =
-    typeof process !== 'undefined' && typeof process.env.MINIMAX_API_BASE === 'string'
+    rtBase ||
+    (typeof process !== 'undefined' && typeof process.env.MINIMAX_API_BASE === 'string'
       ? normalizeMinimaxEnvValue(process.env.MINIMAX_API_BASE)
-      : '';
+      : '');
   /** 开发环境始终走同源 `/minimax-api`，由 Vite 代理到 `MINIMAX_API_BASE`（未配则 .io），避免直连国内/国际域名触发 CORS */
   if (import.meta.env.DEV) return '/minimax-api';
   if (fromEnv) return fromEnv.replace(/\/$/, '');
@@ -60,9 +67,10 @@ export function resolveMinimaxApiRoot(): string {
 /** 部分控制台（含企业/套餐）除 API Key 外提供 GroupId，需作为 URL 查询参数 */
 export function withMinimaxGroupQuery(url: string): string {
   const gid =
-    typeof process !== 'undefined' && typeof process.env.MINIMAX_GROUP_ID === 'string'
+    runtimeMinimaxTrimmed('MINIMAX_GROUP_ID') ||
+    (typeof process !== 'undefined' && typeof process.env.MINIMAX_GROUP_ID === 'string'
       ? normalizeMinimaxEnvValue(process.env.MINIMAX_GROUP_ID)
-      : '';
+      : '');
   if (!gid) return url;
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}GroupId=${encodeURIComponent(gid)}`;
@@ -119,20 +127,26 @@ export async function synthesizeMinimaxTtsToMp3Blob(options: SynthesizeMinimaxOp
   warnMinimaxTokenPlanKeyInDev(apiKey);
 
   const model =
-    (typeof process !== 'undefined' && process.env.MINIMAX_TTS_MODEL) || 'speech-2.8-hd';
+    runtimeMinimaxTrimmed('MINIMAX_TTS_MODEL') ||
+    (typeof process !== 'undefined' && process.env.MINIMAX_TTS_MODEL) ||
+    'speech-2.8-hd';
   const envVoice =
-    typeof process !== 'undefined' && process.env.MINIMAX_VOICE_ID
+    runtimeMinimaxTrimmed('MINIMAX_VOICE_ID') ||
+    (typeof process !== 'undefined' && process.env.MINIMAX_VOICE_ID
       ? process.env.MINIMAX_VOICE_ID.trim()
-      : '';
+      : '');
   // 默认：官方系统音色「磁性男声」；中文为主可在 .env 设 Chinese (Mandarin)_Male_Announcer
   const voiceId =
     (options.voiceId && String(options.voiceId).trim()) ||
     envVoice ||
     'English_magnetic_voiced_man';
+  const speedRt = runtimeMinimaxTrimmed('MINIMAX_TTS_SPEED');
   const speedRaw =
-    typeof process !== 'undefined' && process.env.MINIMAX_TTS_SPEED != null
-      ? Number(process.env.MINIMAX_TTS_SPEED)
-      : 1;
+    speedRt !== ''
+      ? Number(speedRt)
+      : typeof process !== 'undefined' && process.env.MINIMAX_TTS_SPEED != null
+        ? Number(process.env.MINIMAX_TTS_SPEED)
+        : 1;
   const speed = Number.isFinite(speedRaw) && speedRaw > 0 ? Math.min(2, speedRaw) : 1;
 
   const root = resolveMinimaxApiRoot();

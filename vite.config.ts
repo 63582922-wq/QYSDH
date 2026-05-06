@@ -170,7 +170,7 @@ export default defineConfig(({mode}) => {
       // Do not modify — file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
     },
-    /** `vite preview`（Render 等用 start command 跑 preview）会校验 Host，否则报 Blocked request */
+    /** `npm run preview`（vite preview）会校验 Host；Render 生产 `start` 见 `scripts/serve-render-dist.mjs` */
     preview: {
       host: true,
       strictPort: false,

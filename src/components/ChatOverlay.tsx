@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback, forwardRef, u
 import { createPortal } from 'react-dom';
 import { Send, Loader2, Mic, MicOff, Dna, RefreshCw, Save } from 'lucide-react';
 import { GoogleGenAI, Type, LiveServerMessage, Modality } from '@google/genai';
+import { getGeminiApiKey, getGeminiLiveSpeechVoiceNameFromRuntimeOrDefine } from '../appClientEnv';
 import { stripReasoningArtifacts, stripTextForTts, synthesizeMinimaxTtsToMp3Blob } from '../minimaxTts';
 import { getMinimaxApiKey, readStoredMinimaxClonedVoiceId } from '../minimaxVoiceClone';
 
@@ -56,13 +57,13 @@ export interface ChatOverlayHandle {
  * 使用无尾部斜杠的 origin。
  */
 const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
+  apiKey: getGeminiApiKey(),
   httpOptions: {
     baseUrl: 'https://generativelanguage.googleapis.com',
   },
 });
 
-if (!process.env.GEMINI_API_KEY) {
+if (!getGeminiApiKey()) {
   console.error('CRITICAL: GEMINI_API_KEY is not defined in environment!');
 }
 
@@ -250,6 +251,8 @@ const LIVE_PREBUILT_VOICE_OPTIONS: readonly string[] = [
 
 /** 仅 .env / define，不含 session 覆盖（用于「默认」标签文案） */
 function getGeminiLiveSpeechVoiceNameFromEnvOnly(): string {
+  const fromRt = getGeminiLiveSpeechVoiceNameFromRuntimeOrDefine();
+  if (fromRt.length > 0) return fromRt;
   const fromVite = import.meta.env.VITE_GEMINI_LIVE_SPEECH_VOICE_NAME;
   if (fromVite != null && String(fromVite).trim().length > 0) {
     return String(fromVite).trim();
@@ -555,10 +558,10 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   }, [inputText]);
   const [isTyping, setIsTyping] = useState(false);
   const [aiStatus, setAiStatus] = useState<AIStatus>(() =>
-    process.env.GEMINI_API_KEY ? 'connected' : 'failed'
+    getGeminiApiKey() ? 'connected' : 'failed'
   );
   const [aiStatusText, setAiStatusText] = useState(() =>
-    !process.env.GEMINI_API_KEY
+    !getGeminiApiKey()
       ? language === 'zh'
         ? '未检测到 GEMINI_API_KEY'
         : 'Missing GEMINI_API_KEY'
@@ -986,7 +989,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 
   // Refresh status strip when language toggles (no extra API calls — saves free-tier quota).
   useEffect(() => {
-    if (!process.env.GEMINI_API_KEY) {
+    if (!getGeminiApiKey()) {
       setAiStatus('failed');
       setAiStatusText(language === 'zh' ? '未检测到 GEMINI_API_KEY' : 'Missing GEMINI_API_KEY');
       return;
@@ -1774,7 +1777,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     setIsTyping(true);
 
     try {
-      if (!process.env.GEMINI_API_KEY) {
+      if (!getGeminiApiKey()) {
         throw new Error(
           language === 'zh'
             ? '未配置 GEMINI_API_KEY：请在 .env.local 填写 Google AI Studio 密钥以使用文本对话（含复刻模式）。'
@@ -2297,7 +2300,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const startVoiceMode = async () => {
      if (!allowLiveVoice) return;
-     if (!process.env.GEMINI_API_KEY?.trim()) {
+     if (!getGeminiApiKey()) {
        setVoiceBlockingMessage(
          language === 'zh'
            ? '未配置 GEMINI_API_KEY：Live 无法建立连接。请在部署环境写入密钥并重新构建（Render / .env.local）。'
@@ -3831,7 +3834,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                     if (!activeSession || etchAdviceBusy) return;
                     const withoutClosing = activeSession.messages.filter((m) => m.kind !== 'closing_note');
                     let nextMessages: ChatMessage[] = [...withoutClosing];
-                    if (conversationMode === 'text_clone' && process.env.GEMINI_API_KEY) {
+                    if (conversationMode === 'text_clone' && getGeminiApiKey()) {
                       setEtchAdviceBusy(true);
                       const ac = new AbortController();
                       const tid = window.setTimeout(() => ac.abort(), CHAT_SEND_TIMEOUT_MS);

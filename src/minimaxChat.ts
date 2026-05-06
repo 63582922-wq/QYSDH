@@ -7,6 +7,7 @@
  * @see https://platform.minimax.io/docs/api-reference/text-openai-api
  */
 
+import { runtimeEnvTrimmed, runtimeMinimaxTrimmed } from './appClientEnv';
 import { normalizeMinimaxEnvValue } from './minimaxEnv';
 import { getMinimaxApiKey, withMinimaxGroupQuery } from './minimaxTts';
 
@@ -22,6 +23,8 @@ export type MinimaxOpenAiChatMessage =
 
 /** 优先 MINIMAX_CHAT_API_KEY；留空则与语音链路共用 MINIMAX_API_KEY（一把钥匙即可）。 */
 export function getMinimaxChatApiKey(): string {
+  const rt = runtimeMinimaxTrimmed('MINIMAX_CHAT_API_KEY');
+  if (rt) return rt;
   const chatOnly = normalizeMinimaxEnvValue(
     typeof process !== 'undefined' && typeof process.env.MINIMAX_CHAT_API_KEY === 'string'
       ? process.env.MINIMAX_CHAT_API_KEY
@@ -33,6 +36,7 @@ export function getMinimaxChatApiKey(): string {
 
 /** 构建期注入：聊天代理是否与语音共用 `/minimax-api` */
 function minimaxChatUsesSeparateDevProxy(): boolean {
+  if (runtimeEnvTrimmed('MINIMAX_CHAT_SEPARATE_PROXY') === '1') return true;
   return (
     typeof process !== 'undefined' &&
     String(process.env.MINIMAX_CHAT_SEPARATE_PROXY || '').trim() === '1'
@@ -41,13 +45,15 @@ function minimaxChatUsesSeparateDevProxy(): boolean {
 
 export function resolveMinimaxChatApiRoot(): string {
   const chatBase =
-    typeof process !== 'undefined' && typeof process.env.MINIMAX_CHAT_API_BASE === 'string'
+    runtimeMinimaxTrimmed('MINIMAX_CHAT_API_BASE') ||
+    (typeof process !== 'undefined' && typeof process.env.MINIMAX_CHAT_API_BASE === 'string'
       ? normalizeMinimaxEnvValue(process.env.MINIMAX_CHAT_API_BASE)
-      : '';
+      : '');
   const voiceBase =
-    typeof process !== 'undefined' && typeof process.env.MINIMAX_API_BASE === 'string'
+    runtimeMinimaxTrimmed('MINIMAX_API_BASE') ||
+    (typeof process !== 'undefined' && typeof process.env.MINIMAX_API_BASE === 'string'
       ? normalizeMinimaxEnvValue(process.env.MINIMAX_API_BASE)
-      : '';
+      : '');
 
   if (import.meta.env.DEV) {
     return minimaxChatUsesSeparateDevProxy() ? '/minimax-chat-api' : '/minimax-api';
@@ -58,6 +64,8 @@ export function resolveMinimaxChatApiRoot(): string {
 }
 
 export function getMinimaxChatModel(): string {
+  const rt = runtimeMinimaxTrimmed('MINIMAX_CHAT_MODEL');
+  if (rt) return rt;
   const m =
     typeof process !== 'undefined' && process.env.MINIMAX_CHAT_MODEL?.trim()
       ? process.env.MINIMAX_CHAT_MODEL.trim()
@@ -67,6 +75,8 @@ export function getMinimaxChatModel(): string {
 
 /** 带图时用原生 chatcompletion_v2；官方示例为 MiniMax-Text-01（与纯文本推理模型可不同）。 */
 export function getMinimaxChatVisionModel(): string {
+  const rt = runtimeMinimaxTrimmed('MINIMAX_CHAT_VISION_MODEL');
+  if (rt) return rt;
   const m =
     typeof process !== 'undefined' && process.env.MINIMAX_CHAT_VISION_MODEL?.trim()
       ? process.env.MINIMAX_CHAT_VISION_MODEL.trim()

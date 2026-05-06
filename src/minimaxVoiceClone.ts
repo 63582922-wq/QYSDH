@@ -13,6 +13,7 @@
  * @see https://platform.minimax.io/docs/api-reference/voice-cloning-clone
  */
 
+import { runtimeMinimaxTrimmed } from './appClientEnv';
 import {
   getMinimaxApiKey,
   resolveMinimaxApiRoot,
@@ -291,6 +292,7 @@ export async function requestMinimaxVoiceClone(params: {
   const root = resolveMinimaxApiRoot();
   const model =
     params.model ||
+    runtimeMinimaxTrimmed('MINIMAX_TTS_MODEL') ||
     (typeof process !== 'undefined' && process.env.MINIMAX_TTS_MODEL?.trim()) ||
     'speech-2.8-hd';
   const text =

@@ -1110,8 +1110,8 @@ export default function App() {
               {!getMinimaxApiKey() ? (
                 <p className="rounded-lg border border-amber-900/40 bg-amber-950/30 px-2.5 py-2 text-[11px] leading-snug text-amber-100/90 md:text-[10px]">
                   {language === 'zh'
-                    ? '网页里拿不到 MiniMax 密钥：密钥是在「部署时构建」写进页面的，不是填在 Render 里就立刻生效。请到 Render → 本服务 → Environment 确认有 MINIMAX_API_KEY，保存后执行 Manual Deploy → Clear build cache & deploy。构建日志里应出现一行 [vite-build] MiniMax: … MINIMAX_API_KEY=present；若是 MISSING，说明构建机没读到该变量。'
-                    : 'Keys are baked in at build time. In Render: Environment → set MINIMAX_API_KEY → Manual Deploy → Clear build cache & deploy. Build logs should show [vite-build] MiniMax: … MINIMAX_API_KEY=present; if MISSING, the build did not receive the variable.'}
+                    ? '若仍提示未检测：生产环境由启动脚本从 Render 的 Environment 注入密钥（见运行日志 [serve-render-dist]）。保存变量后重新部署；浏览器可强制刷新。本地开发仍用 .env.local + npm run dev。'
+                    : 'Production reads keys from Render Environment at server start (see [serve-render-dist] in logs). Redeploy after saving env vars; hard-refresh the browser. Local dev: .env.local + npm run dev.'}
                 </p>
               ) : null}
               <input
