@@ -96,7 +96,6 @@ export default defineConfig(({mode}) => {
     plugins: [react(), tailwindcss()],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-      'process.env.GEMINI_LIVE_VOICE_MODEL': JSON.stringify(env.GEMINI_LIVE_VOICE_MODEL || ''),
       'process.env.GEMINI_LIVE_SPEECH_VOICE_NAME': JSON.stringify(env.GEMINI_LIVE_SPEECH_VOICE_NAME || ''),
       'process.env.MINIMAX_API_KEY': JSON.stringify(minimaxKeySan),
       'process.env.MINIMAX_API_BASE': JSON.stringify(
@@ -152,8 +151,14 @@ export default defineConfig(({mode}) => {
           : {}),
       },
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
+      // Do not modify — file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
+    },
+    /** `vite preview`（Render 等用 start command 跑 preview）会校验 Host，否则报 Blocked request */
+    preview: {
+      host: true,
+      strictPort: false,
+      allowedHosts: true,
     },
   };
 });

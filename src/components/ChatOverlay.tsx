@@ -65,46 +65,15 @@ if (!process.env.GEMINI_API_KEY) {
   console.error('CRITICAL: GEMINI_API_KEY is not defined in environment!');
 }
 
-/**
- * 文本多轮（含复刻）、主题生成、镌刻「写入回响」等：按序尝试直至成功。
- *
- * 延迟说明：**成功时只请求一次**，总延迟≈该模型首 token / 完稿时间，不会在列表里「挨个试完」。
- * 仅当前面的模型报错（如 not found）才会立刻换下一个，多一两次往返；故把稳定、常快的 Flash 放前面，preview 放中间。
- * Live 语音另用 `LIVE_VOICE_MODEL_CANDIDATES`。
- */
-const TEXT_MODEL_CANDIDATES = [
-  'gemini-2.5-flash',
-  'gemini-flash-latest',
-  'gemini-3-flash-preview',
-  'gemini-2.5-flash-lite',
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-1.5-flash',
-];
+/** 固定：文本多轮（含复刻）、主题、镌刻等；不再链式回退其它模型 ID。 */
+const TEXT_MODEL_ID = 'gemini-2.5-flash';
+const TEXT_MODEL_CANDIDATES = [TEXT_MODEL_ID];
 
 /**
- * Gemini Multimodal Live（bidi）：须用支持 bidiGenerateContent 的模型 ID。
- * AI Studio 下拉里写的「Gemini 3 Flash Live」对应模型码为 **gemini-3.1-flash-live-preview**（见官方页与试玩链接）。
- * 与纯文本的 `gemini-3-flash-preview` 等不是同一个 ID。
+ * 固定：Gemini Multimodal Live（bidi），与 AI Studio「Gemini 3 Flash Live」一致。
  * @see https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-live-preview
- * @see https://aistudio.google.com/live?model=gemini-3.1-flash-live-preview
- *
- * 仅保留名称含 **live** 的预览模型作为回落：与 AI Studio「Live」一致，不把 2.5 `native-audio` 等混称为 Live。
  */
-const LIVE_VOICE_MODEL_CANDIDATES = [
-  'gemini-3.1-flash-live-preview',
-  'gemini-2.0-flash-live-preview-04-09',
-];
-
-function liveVoiceModelCandidates(): string[] {
-  const one =
-    typeof process !== 'undefined' && typeof process.env.GEMINI_LIVE_VOICE_MODEL === 'string'
-      ? process.env.GEMINI_LIVE_VOICE_MODEL.trim()
-      : '';
-  if (!one) return [...LIVE_VOICE_MODEL_CANDIDATES];
-  const rest = LIVE_VOICE_MODEL_CANDIDATES.filter((m) => m !== one);
-  return [one, ...rest];
-}
+const LIVE_VOICE_MODEL_ID = 'gemini-3.1-flash-live-preview';
 
 /** 会话内覆盖 Live 音色（优先于 .env）；不设则用环境默认 */
 const LIVE_VOICE_SESSION_STORAGE_KEY = 'subconscious_gemini_live_voice_override';
@@ -1623,7 +1592,7 @@ Tone: skip apologies and filler; when unsure, stay curious.
 Output only what the user should read: no chain-of-thought, no angle-bracket tags, no "Let me think step by step" outlines—start immediately as if talking to a friend.`;
   };
 
-  /** 镌刻「写入回响」：`ai.models.generateContent` + 与 `TEXT_MODEL_CANDIDATES` 相同的回退顺序。 */
+  /** 镌刻「写入回响」：`ai.models.generateContent`，模型固定为 `TEXT_MODEL_ID`。 */
   const generateCloneClosingAdvice = async (dialogueMessages: ChatMessage[], signal?: AbortSignal) => {
     const chatLog = dialogueMessages
       .map((m) => {
@@ -2520,11 +2489,11 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         }
         muteOut.connect(audioContext.destination);
 
-        // Gemini Multimodal Live（必须用 Live 专用模型名，否则常表现为「已连接但无回声」）
+        // Gemini Multimodal Live（固定 `LIVE_VOICE_MODEL_ID`，不再多模型回退）
         let session: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
         let lastLiveConnectError: unknown = null;
-        for (const liveModel of liveVoiceModelCandidates()) {
-          try {
+        const liveModel = LIVE_VOICE_MODEL_ID;
+        try {
             const connectGen = ++liveVoiceSessionGenRef.current;
             const sessionPromise = ai.live.connect({
               model: liveModel,
@@ -2695,11 +2664,9 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             session = await sessionPromise;
             liveSessionRef.current = session;
             console.log('[Live voice] session ready:', liveModel);
-            break;
-          } catch (e) {
+        } catch (e) {
             lastLiveConnectError = e;
             console.warn('[Live voice] connect failed for', liveModel, e);
-          }
         }
 
         if (!session) {

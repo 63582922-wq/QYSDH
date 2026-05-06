@@ -273,7 +273,7 @@ export async function uploadMinimaxVoiceCloneSource(file: File, signal?: AbortSi
   if (id === undefined || id === null || id === '') {
     throw new Error('upload response missing file.file_id');
   }
-  return id;
+  return String(id);
 }
 
 export async function requestMinimaxVoiceClone(params: {

@@ -7,9 +7,10 @@
     "dev": "vite --port=5173 --host=0.0.0.0",
     "dev:restart": "node scripts/kill-dev-ports.mjs && vite --port=5173 --host=0.0.0.0",
     "build": "vite build",
+    "start": "vite preview --host 0.0.0.0 --port ${PORT:-4173}",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "node ./node_modules/typescript/bin/tsc --noEmit"
   },
   "dependencies": {
     "@google/genai": "^1.51.0",
