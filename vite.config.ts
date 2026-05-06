@@ -81,6 +81,12 @@ export default defineConfig(({mode}) => {
     minimaxChatProxyTarget.replace(/\/$/, '') !== minimaxProxyTarget.replace(/\/$/, '');
   const minimaxKeySan = normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_API_KEY'));
   const minimaxChatKeySan = normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_CHAT_API_KEY'));
+  /** 生产构建在 Render 等 CI 上跑时，在 Build Logs 里可核对密钥是否被注入（不打印密钥内容） */
+  if (mode === 'production') {
+    console.info(
+      `[vite-build] MiniMax: MINIMAX_API_KEY=${minimaxKeySan ? 'present' : 'MISSING'}, MINIMAX_CHAT_API_KEY=${minimaxChatKeySan ? 'present' : 'MISSING'}`,
+    );
+  }
   if (mode === 'development') {
     const keyHint = !minimaxKeySan
       ? '（未配置）'
