@@ -37,8 +37,9 @@ interface ChatOverlayProps {
   onSpeechValue?: (val: number) => void;
   isAutoSpeak: boolean;
   setIsAutoSpeak: (val: boolean) => void;
-  /** 上传图像并选定后出现；与 Live 语音链路互斥分流 */
   conversationMode: ConversationMode;
+  /** App 设置抽屉打开时隐藏底部 fixed 输入条/工具栏，避免挡住设置面板 */
+  settingsChromeOpen?: boolean;
   /** 消散重置（与字幕区并排，在右侧图标列） */
   onDissolveReset?: () => void;
   /** 打开保存对话预览 */
@@ -533,6 +534,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     isAutoSpeak,
     setIsAutoSpeak,
     conversationMode,
+    settingsChromeOpen = false,
     onDissolveReset,
     onOpenSavePreview,
   },
@@ -1966,102 +1968,123 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
     startCloneUserMicCapture();
 
-    const rec = new SR();
-    cloneDictationRecognitionRef.current = rec;
-    rec.lang = language === 'zh' ? 'zh-CN' : 'en-US';
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.maxAlternatives = 1;
+    const bindCloneDictationHandlers = (rec: SpeechRecognition, restartDepth: number) => {
+      rec.lang = language === 'zh' ? 'zh-CN' : 'en-US';
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
 
-    rec.onresult = (event: SpeechRecognitionEvent) => {
-      let interim = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const r = event.results[i];
-        if (r.isFinal) {
-          cloneDictationAccumRef.current += r[0]?.transcript ?? '';
-        } else {
-          interim += r[0]?.transcript ?? '';
+      rec.onresult = (event: SpeechRecognitionEvent) => {
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const r = event.results[i];
+          if (r.isFinal) {
+            cloneDictationAccumRef.current += r[0]?.transcript ?? '';
+          } else {
+            interim += r[0]?.transcript ?? '';
+          }
         }
-      }
-      const mid = cloneDictationAccumRef.current.trim();
-      const tail = interim.trim();
-      cloneDictationInterimRef.current = tail;
-      const line = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
-      setCloneLiveCaptionUserLine(line);
-    };
+        const mid = cloneDictationAccumRef.current.trim();
+        const tail = interim.trim();
+        cloneDictationInterimRef.current = tail;
+        const line = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
+        setCloneLiveCaptionUserLine(line);
+      };
 
-    rec.onerror = (ev: SpeechRecognitionErrorEvent) => {
-      console.warn('[Clone dictation]', ev.error);
-      cloneHoldOutcomeRef.current = null;
-      cloneHoldPointerIdRef.current = null;
-      setInputText(cloneHoldSnapshotRef.current.trim());
-      setCloneLiveCaptionUserLine('');
-      cloneDictationAccumRef.current = '';
-      cloneDictationInterimRef.current = '';
-      stopCloneUserMicCapture();
-      if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-        setVoiceBlockingMessage(
-          language === 'zh'
-            ? '无法使用麦克风：请在浏览器中允许本站访问麦克风。'
-            : 'Microphone blocked. Allow mic access for this site.',
-        );
-      }
-      cloneDictationRecognitionRef.current = null;
-      setIsCloneDictating(false);
-      try {
-        rec.stop();
-      } catch {
-        /* ignore */
-      }
-    };
-
-    rec.onend = () => {
-      cloneDictationRecognitionRef.current = null;
-      setIsCloneDictating(false);
-
-      if (cloneHoldCleanupStopRef.current) {
-        cloneHoldCleanupStopRef.current = false;
+      rec.onerror = (ev: SpeechRecognitionErrorEvent) => {
+        console.warn('[Clone dictation]', ev.error);
         cloneHoldOutcomeRef.current = null;
         cloneHoldPointerIdRef.current = null;
-        return;
-      }
-
-      const outcome = cloneHoldOutcomeRef.current;
-      cloneHoldOutcomeRef.current = null;
-      cloneHoldPointerIdRef.current = null;
-
-      if (outcome == null) {
-        return;
-      }
-
-      if (outcome === 'cancel') {
         setInputText(cloneHoldSnapshotRef.current.trim());
         setCloneLiveCaptionUserLine('');
         cloneDictationAccumRef.current = '';
         cloneDictationInterimRef.current = '';
-        return;
-      }
+        stopCloneUserMicCapture();
+        if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+          setVoiceBlockingMessage(
+            language === 'zh'
+              ? '无法使用麦克风：请在浏览器中允许本站访问麦克风。'
+              : 'Microphone blocked. Allow mic access for this site.',
+          );
+        }
+        cloneDictationRecognitionRef.current = null;
+        setIsCloneDictating(false);
+        try {
+          rec.stop();
+        } catch {
+          /* ignore */
+        }
+      };
 
-      const mid = cloneDictationAccumRef.current.trim();
-      const tail = cloneDictationInterimRef.current.trim();
-      const full = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
-      cloneDictationAccumRef.current = '';
-      cloneDictationInterimRef.current = '';
+      rec.onend = () => {
+        if (cloneHoldCleanupStopRef.current) {
+          cloneDictationRecognitionRef.current = null;
+          setIsCloneDictating(false);
+          cloneHoldCleanupStopRef.current = false;
+          cloneHoldOutcomeRef.current = null;
+          cloneHoldPointerIdRef.current = null;
+          return;
+        }
 
-      if (!full) {
+        const stillHolding = cloneHoldPointerIdRef.current !== null;
+        const outcome = cloneHoldOutcomeRef.current;
+
+        /** iOS / 部分 WebKit 会过早结束 continuous 会话：手指仍按住且无松手结论时换实例重开 */
+        if (stillHolding && outcome == null && restartDepth < 22) {
+          try {
+            const next = new SR();
+            bindCloneDictationHandlers(next, restartDepth + 1);
+            cloneDictationRecognitionRef.current = next;
+            next.start();
+            setIsCloneDictating(true);
+            return;
+          } catch (e2) {
+            console.warn('[Clone dictation] re-arm failed', e2);
+          }
+        }
+
+        cloneDictationRecognitionRef.current = null;
+        setIsCloneDictating(false);
+
+        const oc = outcome;
+        cloneHoldOutcomeRef.current = null;
+        cloneHoldPointerIdRef.current = null;
+
+        if (oc == null) {
+          return;
+        }
+
+        if (oc === 'cancel') {
+          setInputText(cloneHoldSnapshotRef.current.trim());
+          setCloneLiveCaptionUserLine('');
+          cloneDictationAccumRef.current = '';
+          cloneDictationInterimRef.current = '';
+          return;
+        }
+
+        const mid = cloneDictationAccumRef.current.trim();
+        const tail = cloneDictationInterimRef.current.trim();
+        const full = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
+        cloneDictationAccumRef.current = '';
+        cloneDictationInterimRef.current = '';
+
+        if (!full) {
+          setInputText(cloneHoldSnapshotRef.current.trim());
+          setCloneLiveCaptionUserLine('');
+          return;
+        }
         setInputText(cloneHoldSnapshotRef.current.trim());
+        armCloneUserDictationHoldAfterSend(full);
         setCloneLiveCaptionUserLine('');
-        return;
-      }
-      /** 先强制恢复输入框为按住前的内容，避免听写被写入 textarea 后与「我说」卡片重复展示 */
-      setInputText(cloneHoldSnapshotRef.current.trim());
-      armCloneUserDictationHoldAfterSend(full);
-      setCloneLiveCaptionUserLine('');
-      sendMessageRef.current({ textOverride: full, preserveInputFromVoiceHold: true });
+        sendMessageRef.current({ textOverride: full, preserveInputFromVoiceHold: true });
+      };
     };
 
+    const rec0 = new SR();
+    bindCloneDictationHandlers(rec0, 0);
     try {
-      rec.start();
+      cloneDictationRecognitionRef.current = rec0;
+      rec0.start();
       setIsCloneDictating(true);
       return true;
     } catch (e) {
@@ -2274,6 +2297,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const startVoiceMode = async () => {
      if (!allowLiveVoice) return;
+     if (!process.env.GEMINI_API_KEY?.trim()) {
+       setVoiceBlockingMessage(
+         language === 'zh'
+           ? '未配置 GEMINI_API_KEY：Live 无法建立连接。请在部署环境写入密钥并重新构建（Render / .env.local）。'
+           : 'GEMINI_API_KEY is missing. Live cannot connect. Set it in your build env and redeploy.',
+       );
+       return;
+     }
      voiceLiveReadyRef.current = false;
      setIsVoiceConnecting(true);
 
@@ -3574,7 +3605,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                 title={language === 'zh' ? '按住说 · 松手发' : 'Hold · release to send'}
                 aria-pressed={isCloneDictating}
                 aria-label={language === 'zh' ? '按住说话，松开发送' : 'Hold to talk, release to send'}
-                className={`touch-none select-none flex h-12 min-h-[48px] w-12 min-w-[48px] shrink-0 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/60 text-zinc-400 shadow-lg backdrop-blur-md transition-colors touch-manipulation hover:bg-zinc-800/80 hover:text-zinc-200 active:bg-zinc-800/80 md:h-14 md:min-h-[56px] md:w-14 md:min-w-[56px] ${
+                className={`select-none flex h-12 min-h-[48px] w-12 min-w-[48px] shrink-0 touch-manipulation items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/60 text-zinc-400 shadow-lg backdrop-blur-md transition-colors hover:bg-zinc-800/80 hover:text-zinc-200 active:bg-zinc-800/80 md:h-14 md:min-h-[56px] md:w-14 md:min-w-[56px] ${
                   isCloneDictating
                     ? 'border-emerald-500/45 text-emerald-400 shadow-[0_0_16px_rgba(52,211,153,0.12)] hover:bg-zinc-900/60'
                     : 'disabled:opacity-30'
@@ -3590,7 +3621,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
       </div>
 
-      {isOpen && conversationMode === 'text_clone' && !allowLiveVoice
+      {isOpen && conversationMode === 'text_clone' && !allowLiveVoice && !settingsChromeOpen
         ? createPortal(
             <div className="pointer-events-none fixed inset-x-0 bottom-0 z-[45] flex justify-center px-3 pb-[max(0.35rem,env(safe-area-inset-bottom))] pt-1 sm:px-4">
               <div className="pointer-events-auto flex w-full max-w-[min(22rem,calc(100vw-1.5rem))] flex-row items-center gap-1.5 md:gap-2">
@@ -3627,7 +3658,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
           )
         : null}
 
-      {isOpen && allowLiveVoice && showOverlayToolbar
+      {isOpen && allowLiveVoice && showOverlayToolbar && !settingsChromeOpen
         ? createPortal(
             <div className="pointer-events-none fixed inset-x-0 bottom-0 z-[45] flex justify-center px-3 pb-[max(0.35rem,env(safe-area-inset-bottom))] pt-1 sm:px-4">
               <div className="pointer-events-auto flex w-full max-w-[min(22rem,calc(100vw-1.5rem))] flex-row items-center justify-between gap-3 px-0.5">

@@ -458,7 +458,15 @@ export default function App() {
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       e.target.value = '';
-      if (!file || !getMinimaxApiKey()) return;
+      if (!file) return;
+      if (!getMinimaxApiKey()) {
+        setCloneVoiceHint(
+          language === 'zh'
+            ? '请先配置 MINIMAX_API_KEY（部署环境或 .env.local），保存后重新构建。'
+            : 'Set MINIMAX_API_KEY in your environment and redeploy (or .env.local for dev).',
+        );
+        return;
+      }
 
       const bad = validateCloneAudioFile(file, language);
       if (bad) {
@@ -945,6 +953,7 @@ export default function App() {
         isAutoSpeak={isAutoSpeak}
         setIsAutoSpeak={setIsAutoSpeak}
         conversationMode={(conversationMode ?? 'live') as ConversationMode}
+        settingsChromeOpen={showSettings}
         onDissolveReset={handleDissolveReset}
         onOpenSavePreview={() => chatOverlayRef.current?.openSavePreview()}
       />
@@ -1026,14 +1035,14 @@ export default function App() {
             <button
               type="button"
               aria-label={language === 'zh' ? '关闭设置' : 'Close settings'}
-              className="fixed inset-0 z-[49] bg-black/55 backdrop-blur-[2px] md:hidden touch-manipulation"
+              className="fixed inset-0 z-[99] bg-black/55 backdrop-blur-[2px] md:hidden touch-manipulation"
               onClick={() => setShowSettings(false)}
             />
           )}
 
           {/* 设置：手机底部抽屉 / md+ 右上角 */}
           <div
-            className={`fixed z-[50] bg-[#0a0a0a]/95 backdrop-blur-xl border-zinc-900 shadow-2xl transition-all duration-300 overflow-y-auto overscroll-contain touch-manipulation
+            className={`fixed z-[100] bg-[#0a0a0a]/95 backdrop-blur-xl border-zinc-900 shadow-2xl transition-all duration-300 overflow-y-auto overscroll-contain touch-manipulation
               max-md:inset-x-0 max-md:bottom-0 max-md:top-auto max-md:rounded-t-[1.75rem] max-md:border-t max-md:border-x-0 max-md:border-b-0 max-md:max-h-[min(88dvh,100svh)] max-md:pb-[calc(env(safe-area-inset-bottom)+0.75rem)] max-md:pt-4 max-md:px-5
               md:absolute md:left-auto md:right-[max(1rem,env(safe-area-inset-right))] md:top-[calc(env(safe-area-inset-top)+3.75rem)] md:bottom-auto md:w-[min(18rem,calc(100vw-2rem))] md:max-h-[min(72dvh,calc(100svh-6rem))] md:rounded-2xl md:border md:p-6
               ${showSettings ? 'opacity-100 pointer-events-auto translate-y-0 md:scale-100' : 'opacity-0 pointer-events-none max-md:translate-y-full md:-translate-y-2 md:scale-95'}
@@ -1094,11 +1103,17 @@ export default function App() {
             </div>
           </div>
 
-          {getMinimaxApiKey() ? (
-            <div className="space-y-2 border-t border-zinc-900 pt-4 md:space-y-3 md:pt-4">
+          <div className="space-y-2 border-t border-zinc-900 pt-4 md:space-y-3 md:pt-4">
               <div className="text-xs font-medium uppercase tracking-widest text-zinc-500">
                 {language === 'zh' ? 'MiniMax 复刻音色' : 'MiniMax voice clone'}
               </div>
+              {!getMinimaxApiKey() ? (
+                <p className="rounded-lg border border-amber-900/40 bg-amber-950/30 px-2.5 py-2 text-[11px] leading-snug text-amber-100/90 md:text-[10px]">
+                  {language === 'zh'
+                    ? '未检测到 MINIMAX_API_KEY：无法调用上传/复刻接口。请在部署环境（如 Render）配置后重新构建；本地写入 .env.local 后重启 dev。'
+                    : 'MINIMAX_API_KEY is missing. Configure it in your host (e.g. Render) and redeploy, or .env.local for dev.'}
+                </p>
+              ) : null}
               <input
                 ref={cloneAudioInputRef}
                 type="file"
@@ -1170,7 +1185,7 @@ export default function App() {
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  disabled={cloneVoiceBusy}
+                  disabled={cloneVoiceBusy || !getMinimaxApiKey()}
                   onClick={() => cloneAudioInputRef.current?.click()}
                   className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900/80 px-2.5 py-2 text-[10px] font-medium uppercase tracking-wider text-zinc-300 transition-colors hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-40 md:min-h-0 md:py-1.5 md:text-[11px]"
                 >
@@ -1192,7 +1207,6 @@ export default function App() {
                 </p>
               )}
             </div>
-          ) : null}
 
           <div className="space-y-2 md:space-y-4">
             <div className="flex items-center justify-between text-xs font-medium uppercase tracking-widest text-zinc-500">
