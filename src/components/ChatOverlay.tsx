@@ -11,7 +11,7 @@ export interface ChatMessage {
   text: string;
   /** 复刻模式「镌刻记忆」成功后追加的知心结语，仅存档与预览；不参与实时字幕与自动朗读 */
   kind?: 'closing_note';
-  /** 历史会话可能残留；当前版本聊天不再向模型附带画布照片 */
+  /** 历史会话可能残留；Live/复刻文本请求可附带画布照片（见 sendMessage inlineData） */
   isInitialImage?: boolean;
   attachedImageDataUrl?: string;
 }
@@ -631,6 +631,11 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   isOpenRef.current = isOpen;
   const conversationModeRef = useRef(conversationMode);
   conversationModeRef.current = conversationMode;
+
+  const currentImageDataUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    currentImageDataUrlRef.current = currentImageDataUrl ?? null;
+  }, [currentImageDataUrl]);
 
   // Real-time Voice State
   const [isVoiceMode, setIsVoiceMode] = useState(false);
@@ -1574,7 +1579,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 - 禁止客服腔、播音腔：少用「很高兴」「感谢您的分享」等套话；共情要落到对方话题的细节上。
 
 关于「图」与画面（很重要）：
-用户上传的照片**只用于界面上的粒子化视觉**，聊天接口**不会把图片像素发给你**。不要假装你「看见了照片里有什么细节」；除非对方在文字里主动描述了场景或物体，你再顺着 TA 的描述聊氛围与感受。不要写图像识别式清单。
+若当次用户消息里**附带了你收到的图像**，请结合画面与文字一起理解，从氛围与感受接话，不要写成冷冰冰的识图清单。若当次**没有**附带图像，则画布照片主要用于界面粒子；此时不要假装看到具体像素细节，除非对方在文字里主动描述了场景。
 
 说话方式：
 像关系不错的朋友发微信：短句、好读，有一点点停顿没关系。别自称「AI」「助手」，别说「这张图像显示了」「根据分析」——就当真的在看、在听。可以用一两句共鸣或观察，但别把对方的话整段复述回来当答案。
@@ -1597,7 +1602,7 @@ Warmth and sounding human (critical—avoid robotic tone):
 - No essay or slide-deck voice: avoid "First,… Second,…" or "In summary" unless they explicitly asked for a list.
 - No corporate/service-scripts; empathy should reference their specifics, not platitudes.
 
-Their photo is rendered as particle art in the UI only—**you do not receive image pixels in chat**. Do not invent visual details you "see." If they describe the scene in words, riff on that mood; never do a fake vision inventory.
+If this user turn **includes an image you receive**, use it together with their text—stay warm and companionable; do not do a cold object-by-object vision inventory. If **no image** is attached, the canvas photo may be UI-only particles—then do not invent pixel-level details unless they describe the scene in words.
 
 Sound human: short, easy sentences; no report or customer-service voice. Never say "as an AI" or "this image shows"—you're simply there with them. A little resonance goes a long way; don't echo their whole message back as your reply.
 
@@ -1650,13 +1655,13 @@ Rules: 2–5 short sentences, spoken and sincere; no bullet lists, no clinical l
     if (language === 'zh') {
       return `使用中文（普通话口语）。用户可能夹杂英文词，你仍须用自然、流畅的中文语音和文字回复，不要用翻译腔或书面语堆砌。
 主打陪伴：听对方说什么、什么语气，你就用什么节奏接——轻松别端着，低落别插科打诨，短句就别长篇大论。语气里要带一点真情绪（好奇、好笑、心疼等），针对对方说的具体内容，不要念稿式安慰。
-你没有收到画面像素；若对方口头描述了场景，再顺着氛围接话，不要假装在做图像分析。
+连接开始时可能会收到一张对方画布上的记忆照片作语境；若有，可从氛围接话，不要像识图 API 一样罗列物体。若未收到图像，对方口头描述场景时再顺着接，不要编造画面细节。
 语速平稳、从容，不要赶。每次回答约 2～3 句短话，最后提一个简短、有启发性的追问。
 不要用「作为人工智能」「这张图像显示了」等套话，不要客服腔和条目式「首先其次」，不要多余道歉。`;
     }
     return `You are a warm, insightful friend. The user may speak Chinese or other languages, but you must reply ONLY in natural English for both speech and any text. Use idiomatic English—do not translate literally from Chinese in a stiff way.
 Companionship first: mirror how they sound—playful if they're playful, gentle if they're low, brief if they're brief. Let real feeling peek through (curiosity, warmth, light humor) tied to their actual words—not generic reassurance.
-You do not receive the photo in this channel; if they describe what they see, respond to that—no fake visual inventory.
+The session may open with one canvas memory photo for context; if present, respond to the mood—no fake inventory. If not, only riff on visuals they describe in speech.
 Speak at a calm, moderate pace (not rushed). Keep each reply to about 2–3 short sentences, then ask one brief, thoughtful follow-up question.
 Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid unnecessary apologies.`;
   };
@@ -1805,7 +1810,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         }));
 
       const contents: any[] = [{ text: currentInput }];
-      if (conversationMode === 'text_clone') {
+      if (conversationMode === 'text_clone' || conversationMode === 'live') {
         const inlineImg = parseDataUrlForGeminiInline(currentImageDataUrl?.trim() ?? '');
         if (inlineImg) {
           contents.push({ inlineData: { mimeType: inlineImg.mimeType, data: inlineImg.data } });
@@ -2709,6 +2714,31 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             session = await sessionPromise;
             liveSessionRef.current = session;
             console.log('[Live voice] session ready:', liveModel);
+
+            const bootImg = parseDataUrlForGeminiInline(currentImageDataUrlRef.current?.trim() ?? '');
+            if (bootImg && liveSessionRef.current === session) {
+              try {
+                session.sendClientContent({
+                  turns: [
+                    {
+                      role: 'user',
+                      parts: [
+                        { inlineData: { mimeType: bootImg.mimeType, data: bootImg.data } },
+                        {
+                          text:
+                            language === 'zh'
+                              ? '（上方为对方当前画布上的记忆照片，仅供陪伴语境；请从情绪与氛围回应，勿逐条罗列物体。）'
+                              : '(Above: their memory photo on the canvas—for companionship context; do not inventory objects.)',
+                        },
+                      ],
+                    },
+                  ],
+                  turnComplete: false,
+                });
+              } catch (imgErr) {
+                console.warn('[Live voice] attach startup photo failed', imgErr);
+              }
+            }
         } catch (e) {
             lastLiveConnectError = e;
             console.warn('[Live voice] connect failed for', liveModel, e);
