@@ -152,6 +152,7 @@ function drawRibbonVoiceprint(
   timeMs: number,
   accent: 'cyan' | 'rose' = 'cyan',
 ) {
+  if (!freqBytes?.length || width <= 0 || height <= 0) return;
   ctx.save();
   ctx.globalCompositeOperation = 'source-over';
   ctx.fillStyle = '#000000';
@@ -503,6 +504,14 @@ function parseDataUrlForGeminiInline(dataUrl: string): { mimeType: string; data:
   const data = m[2].replace(/\s/g, '');
   if (!data) return null;
   return { mimeType, data };
+}
+
+/** 会话消息 / API 边缘情况：避免渲染期对非字符串 `.trim()` 抛错（移动端易触发 ErrorBoundary 黑屏） */
+function safeMsgText(t: unknown): string {
+  if (t == null) return '';
+  if (typeof t === 'string') return t;
+  if (typeof t === 'number' || typeof t === 'boolean') return String(t);
+  return '';
 }
 
 function sanitizeModelReplyText(text: string): string {
@@ -1037,7 +1046,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       if (m.role === 'model' && m.kind !== 'closing_note') {
         return {
           turnKey: `${activeSession.id}-model-${i}`,
-          text: m.text,
+          text: safeMsgText(m.text),
         };
       }
     }
@@ -1056,7 +1065,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     for (let i = msgs.length - 1; i >= 0; i -= 1) {
       if (msgs[i].role === 'user') {
         lastUserIdx = i;
-        lastUserText = msgs[i].text;
+        lastUserText = safeMsgText(msgs[i].text);
         lastUserImage = msgs[i].attachedImageDataUrl;
         break;
       }
@@ -1082,7 +1091,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     let lastUserImage: string | undefined;
     for (let i = msgs.length - 1; i >= 0; i -= 1) {
       if (msgs[i].role === 'user') {
-        lastUser = msgs[i].text.trim();
+        lastUser = safeMsgText(msgs[i].text).trim();
         lastUserIdx = i;
         lastUserImage = msgs[i].attachedImageDataUrl;
         break;
@@ -1092,7 +1101,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     let lastModelIdx = -1;
     for (let i = msgs.length - 1; i >= 0; i -= 1) {
       if (msgs[i].role === 'model' && msgs[i].kind !== 'closing_note') {
-        lastModel = msgs[i].text.trim();
+        lastModel = safeMsgText(msgs[i].text).trim();
         lastModelIdx = i;
         break;
       }
@@ -1460,10 +1469,12 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         let synthStarted = false;
         utterance.onboundary = (ev) => {
           if (!synthStarted) return;
-          if (ev.charIndex >= 0) {
-            const end = ev.charIndex + (ev.charLength || 0);
-            setCloneTtsRevealLen(Math.min(speakSlice.length, end));
-          }
+          const ci = ev.charIndex;
+          const cl = ev.charLength ?? 0;
+          if (typeof ci !== 'number' || !Number.isFinite(ci) || ci < 0) return;
+          const end = ci + (typeof cl === 'number' && Number.isFinite(cl) ? cl : 0);
+          if (!Number.isFinite(end)) return;
+          setCloneTtsRevealLen(Math.min(speakSlice.length, Math.max(0, end)));
         };
         utterance.onstart = () => {
           synthStarted = true;
@@ -1524,7 +1535,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             if (Number.isFinite(d) && d > 0.05 && Number.isFinite(ct)) {
               const ratio = Math.min(1, ct / d);
               const n = Math.max(0, Math.ceil(plain.length * ratio));
-              setCloneTtsRevealLen(n);
+              if (Number.isFinite(n)) setCloneTtsRevealLen(n);
             }
           }
 
@@ -1916,7 +1927,7 @@ Output only what the user should read: no chain-of-thought, no angle-bracket tag
       .map((m) => {
         const who =
           m.role === 'user' ? (language === 'zh' ? '对方' : 'Them') : language === 'zh' ? '咨询师' : 'Counselor';
-        return `${who}: ${m.text}`;
+        return `${who}: ${safeMsgText(m.text)}`;
       })
       .join('\n');
     const sys =
@@ -1969,7 +1980,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     try {
       const chatLog = messages
         .filter((m) => m.kind !== 'closing_note')
-        .map((m) => `${m.role}: ${m.text}`)
+        .map((m) => `${m.role}: ${safeMsgText(m.text)}`)
         .join('\n');
       const response = await generateWithFallback(
         [{ text: `Based on this conversation, generate a very short (2-4 words) poetic theme/title.\n\nConversation:\n${chatLog}` }],
@@ -1977,7 +1988,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
           systemInstruction: `Return ONLY the short title. The title must be in ${language === 'zh' ? 'Chinese' : 'English'}. Be poetic and mysterious.`,
         }
       );
-      return response.text?.trim() || (language === 'zh' ? '潜意识回响' : 'Subconscious Echoes');
+      return extractModelReplyText(response, language === 'zh' ? '潜意识回响' : 'Subconscious Echoes').trim();
     } catch (e) {
       console.error('Failed to generate theme', e);
       return language === 'zh' ? '潜意识片段' : 'Subconscious Fragment';
@@ -2101,7 +2112,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         .slice(0, -1)
         .map((m) => ({
           role: m.role,
-          parts: [{ text: m.text }],
+          parts: [{ text: safeMsgText(m.text) }],
         }));
 
       const contents: any[] = [{ text: currentInput }];
@@ -3234,33 +3245,37 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
       const loop = () => {
         if (cancelled) return;
-        const cv = voiceprintCanvasRef.current;
-        if (!cv || cv.width !== W || cv.height !== H) {
-          voiceprintRafRef.current = requestAnimationFrame(loop);
-          return;
+        try {
+          const cv = voiceprintCanvasRef.current;
+          if (!cv || cv.width !== W || cv.height !== H) {
+            voiceprintRafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+          const c = cv.getContext('2d');
+          if (!c) return;
+          const cloneMic =
+            conversationModeRef.current === 'text_clone' && isCloneDictating;
+          const an = cloneMic ? cloneUserMicAnalyserRef.current : liveVoiceAnalyserRef.current;
+          if (!an) {
+            voiceprintRafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+          an.getByteFrequencyData(freqBuf);
+          let rawE: number;
+          if (cloneMic) {
+            an.getFloatTimeDomainData(tdBuf);
+            let sumSq = 0;
+            for (let i = 0; i < tdBuf.length; i++) sumSq += tdBuf[i] * tdBuf[i];
+            const rms = Math.sqrt(sumSq / Math.max(1, tdBuf.length));
+            rawE = Math.min(1, rms * 34);
+          } else {
+            rawE = Math.min(1, liveInputRmsRef.current * 34);
+          }
+          voiceprintEnergySmoothRef.current += (rawE - voiceprintEnergySmoothRef.current) * 0.26;
+          drawRibbonVoiceprint(c, W, H, freqBuf, voiceprintEnergySmoothRef.current, performance.now());
+        } catch (e) {
+          console.warn('[Voiceprint user]', e);
         }
-        const c = cv.getContext('2d');
-        if (!c) return;
-        const cloneMic =
-          conversationModeRef.current === 'text_clone' && isCloneDictating;
-        const an = cloneMic ? cloneUserMicAnalyserRef.current : liveVoiceAnalyserRef.current;
-        if (!an) {
-          voiceprintRafRef.current = requestAnimationFrame(loop);
-          return;
-        }
-        an.getByteFrequencyData(freqBuf);
-        let rawE: number;
-        if (cloneMic) {
-          an.getFloatTimeDomainData(tdBuf);
-          let sumSq = 0;
-          for (let i = 0; i < tdBuf.length; i++) sumSq += tdBuf[i] * tdBuf[i];
-          const rms = Math.sqrt(sumSq / Math.max(1, tdBuf.length));
-          rawE = Math.min(1, rms * 34);
-        } else {
-          rawE = Math.min(1, liveInputRmsRef.current * 34);
-        }
-        voiceprintEnergySmoothRef.current += (rawE - voiceprintEnergySmoothRef.current) * 0.26;
-        drawRibbonVoiceprint(c, W, H, freqBuf, voiceprintEnergySmoothRef.current, performance.now());
         voiceprintRafRef.current = requestAnimationFrame(loop);
       };
 
@@ -3338,48 +3353,56 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
       const loop = () => {
         if (cancelled) return;
-        const cv = voiceprintAiCanvasRef.current;
-        if (!cv || cv.width !== W || cv.height !== H) {
-          voiceprintAiRafRef.current = requestAnimationFrame(loop);
-          return;
-        }
-        const c = cv.getContext('2d');
-        if (!c) return;
-
-        const an = liveAiVoiceAnalyserRef.current;
-        const t = performance.now();
-        let freqBuf: Uint8Array;
-        let rawE: number;
-
-        if (an) {
-          freqBuf = new Uint8Array(an.frequencyBinCount);
-          const tdBuf = new Float32Array(an.fftSize);
-          an.getByteFrequencyData(freqBuf);
-          an.getFloatTimeDomainData(tdBuf);
-          let sumSq = 0;
-          for (let i = 0; i < tdBuf.length; i++) sumSq += tdBuf[i] * tdBuf[i];
-          const rms = Math.sqrt(sumSq / Math.max(1, tdBuf.length));
-          rawE = Math.min(1, rms * 36);
-        } else if (
-          conversationMode === 'text_clone' &&
-          (isSpeaking || cloneAwaitingTtsStart)
-        ) {
-          freqBuf = new Uint8Array(128);
-          for (let i = 0; i < freqBuf.length; i++) {
-            freqBuf[i] = Math.min(
-              255,
-              (Math.sin(t / 200 + i * 0.08) * 0.5 + 0.5) * 200 + Math.random() * 55,
-            );
+        try {
+          const cv = voiceprintAiCanvasRef.current;
+          if (!cv || cv.width !== W || cv.height !== H) {
+            voiceprintAiRafRef.current = requestAnimationFrame(loop);
+            return;
           }
-          rawE = Math.min(1, 0.42 + Math.sin(t / 160) * 0.12);
-        } else {
-          voiceprintAiRafRef.current = requestAnimationFrame(loop);
-          return;
-        }
+          const c = cv.getContext('2d');
+          if (!c) {
+            voiceprintAiRafRef.current = requestAnimationFrame(loop);
+            return;
+          }
 
-        voiceprintAiEnergySmoothRef.current += (rawE - voiceprintAiEnergySmoothRef.current) * 0.26;
-        drawRibbonVoiceprint(c, W, H, freqBuf, voiceprintAiEnergySmoothRef.current, t, 'rose');
-        voiceprintAiRafRef.current = requestAnimationFrame(loop);
+          const an = liveAiVoiceAnalyserRef.current;
+          const t = performance.now();
+          let freqBuf: Uint8Array;
+          let rawE: number;
+
+          if (an) {
+            freqBuf = new Uint8Array(an.frequencyBinCount);
+            const tdBuf = new Float32Array(an.fftSize);
+            an.getByteFrequencyData(freqBuf);
+            an.getFloatTimeDomainData(tdBuf);
+            let sumSq = 0;
+            for (let i = 0; i < tdBuf.length; i++) sumSq += tdBuf[i] * tdBuf[i];
+            const rms = Math.sqrt(sumSq / Math.max(1, tdBuf.length));
+            rawE = Math.min(1, rms * 36);
+          } else if (
+            conversationMode === 'text_clone' &&
+            (isSpeaking || cloneAwaitingTtsStart)
+          ) {
+            freqBuf = new Uint8Array(128);
+            for (let i = 0; i < freqBuf.length; i++) {
+              freqBuf[i] = Math.min(
+                255,
+                (Math.sin(t / 200 + i * 0.08) * 0.5 + 0.5) * 200 + Math.random() * 55,
+              );
+            }
+            rawE = Math.min(1, 0.42 + Math.sin(t / 160) * 0.12);
+          } else {
+            voiceprintAiRafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+
+          voiceprintAiEnergySmoothRef.current += (rawE - voiceprintAiEnergySmoothRef.current) * 0.26;
+          drawRibbonVoiceprint(c, W, H, freqBuf, voiceprintAiEnergySmoothRef.current, t, 'rose');
+          voiceprintAiRafRef.current = requestAnimationFrame(loop);
+        } catch (e) {
+          console.warn('[Voiceprint AI]', e);
+          voiceprintAiRafRef.current = requestAnimationFrame(loop);
+        }
       };
 
       voiceprintAiRafRef.current = requestAnimationFrame(loop);
@@ -4269,7 +4292,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                              ? 'font-serif text-lg tracking-wide text-rose-100/90 md:text-lg'
                              : 'font-serif text-lg tracking-wide text-zinc-200 md:text-lg'
                        }`}>
-                         {m.text}
+                         {safeMsgText(m.text)}
                        </p>
                     </div>
                  </div>
