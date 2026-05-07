@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, forwardRef, useImperativeHandle } from 'react';
 import { createPortal } from 'react-dom';
-import { Send, Loader2, Mic, MicOff, Dna, RefreshCw, Save } from 'lucide-react';
+import { Send, Loader2, Mic, MicOff, Dna, RefreshCw, Save, Trash2 } from 'lucide-react';
 import { GoogleGenAI, Type, LiveServerMessage, Modality } from '@google/genai';
 import { getGeminiApiKey, getGeminiLiveSpeechVoiceNameFromRuntimeOrDefine } from '../appClientEnv';
 import { stripReasoningArtifacts, stripTextForTts, synthesizeMinimaxTtsToMp3Blob } from '../minimaxTts';
@@ -21,6 +21,8 @@ export interface ChatSession {
   theme: string;
   messages: ChatMessage[];
   updatedAt: number;
+  /** 历史封面：由当前画布图压缩生成，便于列表/轮播展示（消息内附图仍会剥离以省配额） */
+  thumbnailDataUrl?: string;
   /** 在「保存对话 → 镌刻记忆」中确认后写入，用于回忆册粒子展示 */
   etchedToAlbum?: boolean;
   etchedAt?: number;
@@ -428,6 +430,41 @@ function stripAttachedImagesForStorage(list: ChatSession[]): ChatSession[] {
   }));
 }
 
+const HISTORY_COVER_MAX_W = 480;
+const HISTORY_COVER_JPEG = 0.52;
+const HISTORY_CARD_W = 268;
+const HISTORY_CARD_GAP = 30;
+
+/** 从历史画布图生成较小 JPEG，写入 session 封面 */
+function makeSessionCoverThumbnail(dataUrl: string): Promise<string | undefined> {
+  const t = dataUrl.trim();
+  if (!t.startsWith('data:image')) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, HISTORY_COVER_MAX_W / Math.max(1, img.width));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(undefined);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', HISTORY_COVER_JPEG));
+      } catch {
+        resolve(undefined);
+      }
+    };
+    img.onerror = () => resolve(undefined);
+    img.src = t;
+  });
+}
+
 function pickLiveAudioBase64FromMessage(message: LiveServerMessage): string | undefined {
   const parts = message.serverContent?.modelTurn?.parts;
   if (!Array.isArray(parts)) return undefined;
@@ -556,13 +593,13 @@ function formatProviderChatError(
     raw.includes('"code":503');
   if (overload && !lower.includes('quota') && !lower.includes('resource_exhausted')) {
     return lang === 'zh'
-      ? 'Google 生成服务暂时繁忙（高峰常见）。应用已依次尝试多个模型；若仍失败请隔几分钟再试，与本地麦克风无关。'
-      : 'Google’s model is temporarily overloaded (common during spikes). We tried fallbacks; wait a few minutes and retry. This is not your microphone.';
+      ? '对话服务暂时繁忙，请隔几分钟再试（与麦克风无关）。'
+      : 'The chat service is busy. Wait a few minutes and try again (not your microphone).';
   }
   if (lower.includes('reported as leaked') || lower.includes('use another api key')) {
     return lang === 'zh'
-      ? 'Google 已禁用当前 GEMINI_API_KEY（判定为泄露，与代码无关）。请到 Google AI Studio 吊销该密钥并新建，仅写入本机 .env.local 或托管平台私密环境变量，勿提交到 Git；改后重启 dev / 重新部署。'
-      : 'Google disabled this GEMINI_API_KEY (reported leaked—not an app bug). Revoke and create a new key in Google AI Studio; store only in .env.local or host secrets, never in Git; restart dev or redeploy.';
+      ? '当前访问密钥已失效，请联系提供方或更新配置后重试。'
+      : 'Your access key is no longer valid. Update credentials and try again.';
   }
   if (
     lower.includes('api_key_invalid') ||
@@ -571,8 +608,8 @@ function formatProviderChatError(
     (lower.includes('invalid_argument') && lower.includes('api key'))
   ) {
     return lang === 'zh'
-      ? 'Gemini 未接受当前密钥（无效或未带上）。请检查 .env.local 里 GEMINI_API_KEY 是否整段复制、无多余空格/换行；不要用中文引号包裹；保存后强刷或执行 npm run start:fresh。'
-      : 'Gemini rejected the key (missing/invalid). Check GEMINI_API_KEY in .env.local—full copy, no extra spaces/newlines; hard-refresh or npm run start:fresh.';
+      ? '身份验证失败，请确认服务已正确配置后重试。'
+      : 'Authentication failed. Check your setup and try again.';
   }
   if (
     raw.includes('429') ||
@@ -584,15 +621,15 @@ function formatProviderChatError(
     return lang === 'zh' ? quotaHint.zh : quotaHint.en;
   }
   if (raw.length > 280) {
-    return lang === 'zh' ? '请求失败（详情请打开浏览器控制台查看）' : 'Request failed (see browser console for details).';
+    return lang === 'zh' ? '请求失败，请稍后再试。' : 'Request failed. Please try again.';
   }
-  return lang === 'zh' ? `请求失败：${raw}` : `Request failed: ${raw}`;
+  return lang === 'zh' ? '请求失败，请稍后再试。' : 'Request failed. Please try again.';
 }
 
 function formatGeminiUserMessage(error: unknown, lang: 'zh' | 'en'): string {
   return formatProviderChatError(error, lang, {
-    zh: '已达到 Gemini 免费额度或频率上限，请稍后再试；或在 Google AI Studio 查看用量 / 升级计费。',
-    en: 'Gemini free-tier quota or rate limit reached. Wait and retry, check usage in AI Studio, or upgrade billing.',
+    zh: '用量已达上限或请求过于频繁，请稍后再试。',
+    en: 'Quota or rate limit reached. Wait and try again.',
   });
 }
 
@@ -621,6 +658,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
    */
   type AIStatus = 'connected' | 'failed';
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [inputText, setInputText] = useState('');
   const inputTextRef = useRef('');
@@ -634,8 +673,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const [aiStatusText, setAiStatusText] = useState(() =>
     !getGeminiApiKey()
       ? language === 'zh'
-        ? '未检测到 GEMINI_API_KEY'
-        : 'Missing GEMINI_API_KEY'
+        ? '未配置对话服务'
+        : 'Chat service not configured'
       : language === 'zh'
         ? '已就绪 · 发送消息开始对话'
         : 'Ready · send a message to start'
@@ -663,6 +702,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneTtsHoldTimerRef = useRef<number | null>(null);
   const speechSynthRafRef = useRef<number | null>(null);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
+  /** 历史回忆立体轮播当前焦点（与 sortedHistorySessions 下标对齐） */
+  const [historySlideIdx, setHistorySlideIdx] = useState(0);
+  const historySwipeX0 = useRef<number | null>(null);
   const floatIdleHideTimerRef = useRef<number | null>(null);
   const floatAfterFadeTimerRef = useRef<number | null>(null);
   const clearFloatingDisplayTimers = useCallback(() => {
@@ -719,6 +761,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const liveVoiceReconnectTimerRef = useRef<number | null>(null);
   /** onclose 定时器重连须调用最新 startVoiceMode，避免闭包陈旧 */
   const startVoiceModeRef = useRef<(() => void) | null>(null);
+  /** 供其它 effect 调用最新 stopVoiceMode，避免依赖函数本体导致重复执行 */
+  const stopVoiceModeRef = useRef<(opts?: { preserveLiveVoiceHandoff?: boolean }) => void>(() => {});
   const nextPlayTimeRef = useRef<number>(0);
   const audioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -748,6 +792,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const voiceprintAiCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const voiceprintAiRafRef = useRef<number | null>(null);
   const voiceprintAiEnergySmoothRef = useRef(0);
+  /** Live：首段 PCM 排程在未来时刻时，推迟 setIsSpeaking(true)，避免声纹早于扬声器出声 */
+  const liveAiSpeakingDelayTimerRef = useRef<number | null>(null);
 
   /** 复刻链路：浏览器 SpeechRecognition → 按住说话，松手自动发送（同微信逻辑；不走 Live） */
   const [isCloneDictating, setIsCloneDictating] = useState(false);
@@ -845,6 +891,11 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const isAIActive = isTyping || isSpeaking || isVoiceConnecting;
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
+
+  const sortedHistorySessions = useMemo(
+    () => [...sessions].sort((a, b) => b.updatedAt - a.updatedAt),
+    [sessions],
+  );
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
 
@@ -1063,11 +1114,64 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     }
   }, []);
 
+  /** 打开历史时，把轮播焦点对齐当前会话 */
+  useEffect(() => {
+    if (!showHistoryModal) return;
+    const i = sortedHistorySessions.findIndex((s) => s.id === activeSessionId);
+    setHistorySlideIdx(i >= 0 ? i : 0);
+  }, [showHistoryModal, activeSessionId, sortedHistorySessions]);
+
+  /** 回忆长廊：键盘左右切页 */
+  useEffect(() => {
+    if (!showHistoryModal) return;
+    const max = Math.max(0, sortedHistorySessions.length - 1);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        setHistorySlideIdx((i) => Math.max(0, i - 1));
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        setHistorySlideIdx((i) => Math.min(max, i + 1));
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showHistoryModal, sortedHistorySessions.length]);
+
+  /** 当前会话尚无封面时，用画布图补一张（旧数据兼容） */
+  useEffect(() => {
+    if (!activeSessionId || !currentImageDataUrl?.trim()) return;
+    let cancelled = false;
+    const sid = activeSessionId;
+    const img = currentImageDataUrl.trim();
+    void (async () => {
+      const cur = sessionsRef.current.find((x) => x.id === sid);
+      if (!cur || cur.thumbnailDataUrl) return;
+      const thumb = await makeSessionCoverThumbnail(img);
+      if (cancelled || !thumb) return;
+      setSessions((prev) => {
+        const ix = prev.findIndex((x) => x.id === sid);
+        if (ix < 0) return prev;
+        if (prev[ix]?.thumbnailDataUrl) return prev;
+        const next = prev.map((x, i) => (i === ix ? { ...x, thumbnailDataUrl: thumb } : x));
+        try {
+          localStorage.setItem('subconscious_sessions', JSON.stringify(stripAttachedImagesForStorage(next)));
+        } catch (e) {
+          console.error('Failed to persist session thumbnail', e);
+        }
+        return next;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, currentImageDataUrl]);
+
   // Refresh status strip when language toggles (no extra API calls — saves free-tier quota).
   useEffect(() => {
     if (!getGeminiApiKey()) {
       setAiStatus('failed');
-      setAiStatusText(language === 'zh' ? '未检测到 GEMINI_API_KEY' : 'Missing GEMINI_API_KEY');
+      setAiStatusText(language === 'zh' ? '未配置对话服务' : 'Chat service not configured');
       return;
     }
     if (lastChatErrorRef.current != null) {
@@ -1618,7 +1722,49 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     };
     saveSessions([newSession, ...sessions]);
     setActiveSessionId(newSession.id);
+    const img = currentImageDataUrl?.trim();
+    if (img) {
+      const sid = newSession.id;
+      void makeSessionCoverThumbnail(img).then((thumb) => {
+        if (!thumb) return;
+        setSessions((prev) => {
+          const ix = prev.findIndex((x) => x.id === sid);
+          if (ix < 0) return prev;
+          if (prev[ix]?.thumbnailDataUrl) return prev;
+          const next = prev.map((x, i) => (i === ix ? { ...x, thumbnailDataUrl: thumb } : x));
+          try {
+            localStorage.setItem('subconscious_sessions', JSON.stringify(stripAttachedImagesForStorage(next)));
+          } catch (e) {
+            console.error('Failed to persist session thumbnail', e);
+          }
+          return next;
+        });
+      });
+    }
   };
+
+  const deleteSessionById = useCallback(
+    (id: string) => {
+      const ok = window.confirm(language === 'zh' ? '确定删除这段回忆？' : 'Delete this memory?');
+      if (!ok) return;
+      const sortedBefore = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+      const delIdx = sortedBefore.findIndex((s) => s.id === id);
+      const next = sessions.filter((s) => s.id !== id);
+      saveSessions(next);
+      if (activeSessionId === id) {
+        const sortedAfter = [...next].sort((a, b) => b.updatedAt - a.updatedAt);
+        setActiveSessionId(sortedAfter[0]?.id ?? null);
+      }
+      setHistorySlideIdx((hi) => {
+        if (next.length === 0) return 0;
+        if (delIdx < 0) return Math.min(hi, next.length - 1);
+        if (delIdx < hi) return Math.max(0, hi - 1);
+        if (delIdx === hi) return Math.min(hi, next.length - 1);
+        return Math.min(hi, next.length - 1);
+      });
+    },
+    [sessions, activeSessionId, language],
+  );
 
   /** 复刻文本（Gemini 多轮）：只定义角色；与 Live 文本提示拆条，勿混用。 */
   const getCloneCounselorSystemInstruction = () => {
@@ -1860,9 +2006,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     try {
       if (!getGeminiApiKey()) {
         throw new Error(
-          language === 'zh'
-            ? '未配置 GEMINI_API_KEY：请在 .env.local 填写 Google AI Studio 密钥以使用文本对话（含复刻模式）。'
-            : 'Missing GEMINI_API_KEY: set it in .env.local for text chat (including voice-clone mode).',
+          language === 'zh' ? '未配置对话服务，无法发送消息。' : 'Chat service not configured.',
         );
       }
 
@@ -2036,9 +2180,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
   const beginCloneHoldSpeechRecognition = (): boolean => {
     if (!window.isSecureContext) {
       setVoiceBlockingMessage(
-        language === 'zh'
-          ? '语音输入需要 HTTPS 或本机 localhost。'
-          : 'Voice input requires HTTPS or localhost.',
+        language === 'zh' ? '语音输入需通过安全连接（HTTPS）使用。' : 'Voice input requires a secure (HTTPS) connection.',
       );
       return false;
     }
@@ -2048,9 +2190,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
     if (!SR) {
       setVoiceBlockingMessage(
-        language === 'zh'
-          ? '当前浏览器不支持网页语音识别（推荐 Chrome / Edge）。'
-          : 'Speech recognition not supported. Try Chrome or Edge.',
+        language === 'zh' ? '当前浏览器不支持网页语音识别。' : 'Speech recognition is not supported in this browser.',
       );
       return false;
     }
@@ -2241,12 +2381,30 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     source.start(playTime);
     nextPlayTimeRef.current = playTime + audioBuffer.duration;
 
+    const alreadyQueued = audioSourcesRef.current.length > 0;
     audioSourcesRef.current.push(source);
-    
-    setIsSpeaking(true);
+
+    const markSpeaking = () => {
+      liveAiSpeakingDelayTimerRef.current = null;
+      setIsSpeaking(true);
+    };
+    const delayMs = Math.max(0, (playTime - audioCtx.currentTime) * 1000);
+    if (!alreadyQueued && delayMs > 24) {
+      if (liveAiSpeakingDelayTimerRef.current != null) {
+        window.clearTimeout(liveAiSpeakingDelayTimerRef.current);
+      }
+      liveAiSpeakingDelayTimerRef.current = window.setTimeout(markSpeaking, delayMs);
+    } else {
+      markSpeaking();
+    }
+
     source.onended = () => {
        audioSourcesRef.current = audioSourcesRef.current.filter(s => s !== source);
        if (audioSourcesRef.current.length === 0) {
+           if (liveAiSpeakingDelayTimerRef.current != null) {
+             window.clearTimeout(liveAiSpeakingDelayTimerRef.current);
+             liveAiSpeakingDelayTimerRef.current = null;
+           }
            setIsSpeaking(false);
            if (onSpeechValue) onSpeechValue(0); // Reset vibration
        }
@@ -2269,7 +2427,11 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       window.clearTimeout(liveVoiceReconnectTimerRef.current);
       liveVoiceReconnectTimerRef.current = null;
     }
-    snapshotLiveStreamsToSession();
+    try {
+      snapshotLiveStreamsToSession();
+    } catch (e) {
+      console.warn('snapshotLiveStreamsToSession failed', e);
+    }
     liveVoiceSessionGenRef.current += 1;
     voiceLiveReadyRef.current = false;
     liveMicPcmRemainderRef.current = null;
@@ -2303,6 +2465,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     setIsVoiceMode(false);
     setIsVoiceConnecting(false);
     setIsSpeaking(false);
+    if (liveAiSpeakingDelayTimerRef.current != null) {
+      window.clearTimeout(liveAiSpeakingDelayTimerRef.current);
+      liveAiSpeakingDelayTimerRef.current = null;
+    }
     setLiveCaptionTurns([]);
     liveInputRmsRef.current = 0;
     liveLastVoiceTsRef.current = 0;
@@ -2354,10 +2520,21 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         mediaStreamRef.current = null;
     }
     if (audioContextRef.current) {
-        audioSourcesRef.current.forEach(s => s.stop());
-        audioSourcesRef.current = [];
-        audioContextRef.current.close();
-        audioContextRef.current = null;
+      const ac = audioContextRef.current;
+      audioContextRef.current = null;
+      for (const s of audioSourcesRef.current) {
+        try {
+          s.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      audioSourcesRef.current = [];
+      void Promise.resolve()
+        .then(() => ac.close())
+        .catch(() => {
+          /* 部分 WebKit 在已关闭或竞态下会抛错，吞掉避免未处理 rejection 导致白屏 */
+        });
     }
     if (liveSessionRef.current) {
          try {
@@ -2369,6 +2546,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       setLiveVoiceHandoff(false);
     }
   };
+  stopVoiceModeRef.current = stopVoiceMode;
 
   /** 将当前流式识别/字幕固化为一条历史（一轮完整对话） */
   const flushLiveCaptionTurn = () => {
@@ -2389,11 +2567,11 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const startVoiceMode = async () => {
      if (!allowLiveVoice) return;
+     /** 防止连点或重入在上一路 AudioContext / WS 未清完时又建一路，移动端易无声或整页崩 */
+     if (isVoiceConnecting) return;
      if (!getGeminiApiKey()) {
        setVoiceBlockingMessage(
-         language === 'zh'
-           ? '未配置 GEMINI_API_KEY：Live 无法建立连接。请在部署环境写入密钥并重新构建（Render / .env.local）。'
-           : 'GEMINI_API_KEY is missing. Live cannot connect. Set it in your build env and redeploy.',
+         language === 'zh' ? '未配置对话服务，无法建立语音连接。' : 'Chat service not configured; voice cannot connect.',
        );
        return;
      }
@@ -2402,8 +2580,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
      const timeoutMsg =
        language === 'zh'
-         ? '语音连接超时，请检查网络与 API；若用手机访问 http://局域网地址，请先改用 HTTPS，否则麦克风会被系统禁用。'
-         : 'Voice timed out. Try HTTPS if you opened this page over HTTP on LAN.';
+         ? '语音连接超时。若使用非加密地址访问，请改用 HTTPS 后再试。'
+         : 'Voice connection timed out. Try again over HTTPS if you opened this page without encryption.';
 
      const timeoutId = window.setTimeout(() => {
         if (!voiceLiveReadyRef.current) {
@@ -2419,8 +2597,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
        setLiveVoiceHandoff(false);
        setVoiceBlockingMessage(
          language === 'zh'
-           ? '请在需要「安全网页」的环境使用语音（HTTPS 或本机 localhost）。由于手机打开 http://192.168… 等局域网地址时，浏览器通常会锁定麦克风权限，语音模式无法工作。请改用 HTTPS 部署本页面，或继续使用下方文字对话。'
-           : 'Voice needs a secure context (HTTPS or localhost). Mic access is blocked on plain HTTP (e.g. http://192.168.x.x) on many mobile browsers. Deploy over HTTPS or use text chat below.'
+           ? '语音需在安全网页环境使用（HTTPS）。非加密访问时浏览器可能无法授权麦克风，请改用加密地址打开，或使用下方文字输入。'
+           : 'Voice needs HTTPS. On plain HTTP, the browser may block the microphone. Open this page over HTTPS or use text below.',
        );
        return;
      }
@@ -2430,7 +2608,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
        setIsVoiceConnecting(false);
        setLiveVoiceHandoff(false);
        setVoiceBlockingMessage(
-         language === 'zh' ? '当前浏览器不支持麦克风（无 getUserMedia）。' : 'This browser does not support the microphone API.'
+         language === 'zh' ? '当前浏览器无法使用麦克风。' : 'This browser cannot use the microphone.',
        );
        return;
      }
@@ -2493,8 +2671,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
              name === 'NotAllowedError' || name === 'PermissionDeniedError'
                ? deniedMsg
                : language === 'zh'
-                 ? `麦克风错误：${name || micErr}`
-                 : `Microphone error: ${name || micErr}`
+                 ? '无法使用麦克风，请检查系统与浏览器权限后重试。'
+                 : 'Microphone unavailable. Check system and browser permissions.',
            );
            return;
          }
@@ -2639,8 +2817,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                     liveVoiceSwitchHintTimerRef.current = null;
                   }
                   setLiveVoiceSwitchHint('');
-                  const vn = resolveGeminiLiveSpeechVoiceName();
-                  console.info('[Live voice] model:', liveModel, '| voiceName:', vn);
+                  console.info('[Live voice] session opened');
                 },
                 onmessage: async (message: LiveServerMessage) => {
                   if (connectGen !== liveVoiceSessionGenRef.current) return;
@@ -2713,9 +2890,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                   const abnormalWs = code === 1006 || code === 1011;
                   if (ev?.code === 1008 && typeof ev?.reason === 'string' && ev.reason.length > 0) {
                     setVoiceBlockingMessage(
-                      language === 'zh'
-                        ? `语音模型不可用：${ev.reason.slice(0, 280)}`
-                        : `Live model unavailable: ${ev.reason.slice(0, 280)}`,
+                      language === 'zh' ? '语音服务暂时不可用，请稍后再试。' : 'Voice service is temporarily unavailable.',
                     );
                   }
                   stopVoiceMode();
@@ -2751,8 +2926,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                       );
                       setVoiceBlockingMessage(
                         language === 'zh'
-                          ? '语音连接反复中断（多为网络或本地代理限制）。请换网络或关闭 VPN 后再试，或稍候重新点麦克风。'
-                          : 'Live keeps dropping (often network or VPN/proxy). Try another network or tap the mic again.',
+                          ? '语音连接反复中断，请更换网络或稍后再试。'
+                          : 'Voice keeps dropping. Try another network or again later.',
                       );
                     }
                   }
@@ -2761,9 +2936,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                   if (connectGen !== liveVoiceSessionGenRef.current) return;
                   console.error('[Live voice] error', e);
                   setVoiceBlockingMessage(
-                    language === 'zh'
-                      ? '语音连接错误，请检查网络、API Key 或模型是否支持 Live。'
-                      : 'Voice connection error. Check network, API key, or Live model support.',
+                    language === 'zh' ? '语音连接出错，请检查网络后重试。' : 'Voice connection error. Check your network and retry.',
                   );
                   stopVoiceMode();
                 },
@@ -2827,8 +3000,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
          stopVoiceMode();
          setVoiceBlockingMessage(
            language === 'zh'
-             ? '无法启动语音：请检查网络、API Key，以及是否使用 HTTPS / localhost。详情见浏览器控制台。'
-             : 'Could not start voice. Check network, API key, and HTTPS/localhost. See console for details.'
+             ? '无法启动语音，请检查网络与安全访问方式（HTTPS）后重试。'
+             : 'Could not start voice. Check your network and HTTPS, then try again.',
          );
      }
   };
@@ -2849,6 +3022,15 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
          startVoiceMode();
      }
   };
+
+  /** 打开回忆长廊时结束 Live 语音，避免全屏层叠与 WebAudio / WS 竞态导致无声或白屏 */
+  useEffect(() => {
+    if (!showHistoryModal) return;
+    if (conversationMode !== 'live') return;
+    if (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) {
+      stopVoiceModeRef.current();
+    }
+  }, [showHistoryModal, conversationMode, isVoiceMode, isVoiceConnecting, liveVoiceHandoff]);
 
   const stopCloneDictation = useCallback(
     (opts?: { cleanup?: boolean }) => {
@@ -3073,10 +3255,11 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   /** AI 字幕框声纹：Live（Analyser）；复刻 MiniMax（Analyser）；系统 TTS 无 Analyser 时用合成频谱 */
   useEffect(() => {
+    /** 勿用 liveStreamAi：字幕先出时声纹会跟着动，与扬声器不同步；仅在实际播音 isSpeaking 时驱动 */
     const liveAiPanelVoiceprintVisible =
       allowLiveVoice &&
       (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) &&
-      (liveStreamAi.trim().length > 0 || isSpeaking);
+      isSpeaking;
 
     /** 勿依赖 aiMain 长度：自动朗读在出声前有意清空字幕，若还要求 caption 则画布永远不启动 */
     const cloneAiPanelVoiceprintVisible =
@@ -3266,6 +3449,27 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     </button>
   ) : null;
 
+  const liveVoiceChromeActive = isVoiceMode || isVoiceConnecting || liveVoiceHandoff;
+  const liveMicBarHint = (
+    <p className="pointer-events-none text-center text-[10px] font-medium uppercase tracking-[0.18em] text-zinc-600">
+      {language === 'zh' ? 'LIVE 模式 · 点按麦克风' : 'Live mode · tap mic'}
+    </p>
+  );
+  const liveMicTapButton = (
+    <button
+      type="button"
+      onClick={toggleVoiceMode}
+      className={`flex h-16 min-h-[64px] w-16 min-w-[64px] shrink-0 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/60 text-zinc-500 shadow-lg backdrop-blur-md transition-colors hover:text-zinc-200 touch-manipulation active:bg-zinc-800/50 md:h-[4.25rem] md:min-h-[68px] md:w-[4.25rem] md:min-w-[68px] ${liveVoiceChromeActive ? 'border-rose-900/50 text-rose-500' : ''}`}
+      aria-label={language === 'zh' ? '语音对话' : 'Voice'}
+    >
+      {isVoiceConnecting || liveVoiceHandoff ? (
+        <Loader2 strokeWidth={1.5} className="h-7 w-7 animate-spin md:h-8 md:w-8" />
+      ) : (
+        <Mic strokeWidth={1.5} className="h-7 w-7 md:h-8 md:w-8" />
+      )}
+    </button>
+  );
+
   if (!isOpen) return null;
 
   return (
@@ -3437,8 +3641,6 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                              /* ignore */
                            }
                          }
-                         const effective = v === '__DEFAULT__' ? getGeminiLiveSpeechVoiceNameFromEnvOnly() : v;
-                         console.info('[Live voice] pick:', v === '__DEFAULT__' ? 'default(.env)' : v, '| effective:', effective);
                          setLiveVoiceRevision((n) => n + 1);
                          if (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) {
                            if (liveVoiceSwitchHintTimerRef.current != null) {
@@ -3456,14 +3658,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                        className="max-w-[min(72vw,14rem)] truncate rounded-md border border-zinc-700 bg-zinc-950/90 px-1.5 py-1 font-serif text-[9px] italic text-zinc-300 md:max-w-[16rem] md:text-[10px]"
                        title={
                          language === 'zh'
-                           ? '仅 Google Live 公布的预设名有效；可改 .env 的 GEMINI_LIVE_SPEECH_VOICE_NAME。文字朗读走 MiniMax，与这里无关。'
-                           : 'Only Google Live preset voice names work; set GEMINI_LIVE_SPEECH_VOICE_NAME in .env. Text read-aloud uses MiniMax.'
+                           ? '选择实时语音使用的播报音色。'
+                           : 'Choose the voice used for live replies.'
                        }
                      >
                        <option value="__DEFAULT__">
                          {language === 'zh'
-                           ? `默认（.env：${getGeminiLiveSpeechVoiceNameFromEnvOnly()}）`
-                           : `Default (.env: ${getGeminiLiveSpeechVoiceNameFromEnvOnly()})`}
+                           ? `默认（${getGeminiLiveSpeechVoiceNameFromEnvOnly()}）`
+                           : `Default (${getGeminiLiveSpeechVoiceNameFromEnvOnly()})`}
                        </option>
                        {liveVoiceOptionsForSelect().map((name) => (
                          <option key={name} value={name}>
@@ -3474,7 +3676,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                    </label>
                    <span
                      className="max-w-[min(40vw,7rem)] truncate font-serif text-[9px] italic normal-case tracking-normal text-zinc-600 md:max-w-[10rem] md:text-[10px]"
-                     title={language === 'zh' ? '当前语音（Google 预设名）' : 'Current voice (Google preset name)'}
+                     title={language === 'zh' ? '当前播报音色' : 'Current voice'}
                    >
                      {resolveGeminiLiveSpeechVoiceName()}
                    </span>
@@ -3682,25 +3884,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                 </div>
           ) : null}
           {allowLiveVoice ? (
-            <div className="flex w-full flex-col items-center gap-1.5 py-1.5">
-              <div className="relative flex w-full flex-col items-center justify-center gap-1">
-                <p className="pointer-events-none text-center text-[10px] font-medium uppercase tracking-[0.18em] text-zinc-600">
-                  {language === 'zh' ? 'Live 语音 · 点按麦克风' : 'Live voice · tap mic'}
-                </p>
-                <button
-                  type="button"
-                  onClick={toggleVoiceMode}
-                  className={`flex h-12 min-h-[48px] w-12 min-w-[48px] shrink-0 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/60 text-zinc-500 shadow-lg backdrop-blur-md transition-colors hover:text-zinc-200 touch-manipulation active:bg-zinc-800/50 md:h-14 md:min-h-[56px] md:w-14 md:min-w-[56px] ${isVoiceMode || isVoiceConnecting || liveVoiceHandoff ? 'border-rose-900/50 text-rose-500' : ''}`}
-                  aria-label={language === 'zh' ? '语音对话' : 'Voice'}
-                >
-                  {isVoiceConnecting || liveVoiceHandoff ? (
-                    <Loader2 strokeWidth={1.5} className="h-[22px] w-[22px] animate-spin md:h-6 md:w-6" />
-                  ) : (
-                    <Mic strokeWidth={1.5} className="h-[22px] w-[22px] md:h-6 md:w-6" />
-                  )}
-                </button>
+            !showOverlayToolbar ? (
+              <div className="flex w-full flex-col items-center gap-1.5 py-1.5">
+                <div className="relative flex w-full flex-col items-center justify-center gap-1">
+                  {liveMicBarHint}
+                  {liveMicTapButton}
+                </div>
               </div>
-            </div>
+            ) : null
           ) : (
             <div className="relative flex w-full flex-col items-center gap-2 md:gap-2.5">
               <button
@@ -3779,8 +3970,20 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       {isOpen && allowLiveVoice && showOverlayToolbar && !settingsChromeOpen
         ? createPortal(
             <div className="pointer-events-none fixed inset-x-0 bottom-0 z-[45] flex justify-center px-3 pb-[max(0.35rem,env(safe-area-inset-bottom))] pt-1 sm:px-4">
-              <div className="pointer-events-auto flex w-full max-w-[min(22rem,calc(100vw-1.5rem))] flex-row items-center justify-between gap-3 px-0.5">
+              <div
+                className={`pointer-events-auto flex w-full max-w-[min(22rem,calc(100vw-1.5rem))] items-end ${
+                  liveVoiceChromeActive
+                    ? 'flex-row justify-between gap-3 px-0.5'
+                    : 'flex-row items-end justify-center gap-5 md:gap-7'
+                }`}
+              >
                 {overlayResetBtn}
+                {!liveVoiceChromeActive ? (
+                  <div className="flex flex-col items-center gap-1 pb-0.5">
+                    {liveMicBarHint}
+                    {liveMicTapButton}
+                  </div>
+                ) : null}
                 {overlaySaveBtn}
               </div>
             </div>,
@@ -3790,10 +3993,12 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
       {showHistoryModal &&
         createPortal(
-          <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 p-4 backdrop-blur-md pointer-events-auto pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+          <div className="fixed inset-0 z-[9999] flex flex-col bg-[#030303] pointer-events-auto pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_50%_120%,rgba(39,39,42,0.55)_0%,transparent_55%)]" />
+            <div className="pointer-events-none absolute inset-0 opacity-[0.04] bg-[url('https://www.transparenttextures.com/patterns/stardust.png')]" />
             <button
               type="button"
-              className="absolute inset-0 cursor-default"
+              className="absolute inset-0 z-0 cursor-default"
               aria-label={language === 'zh' ? '关闭' : 'Close'}
               onClick={() => setShowHistoryModal(false)}
             />
@@ -3801,62 +4006,181 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
               role="dialog"
               aria-modal="true"
               aria-label={language === 'zh' ? '历史对话' : 'Chat history'}
-              className="relative z-[1] flex max-h-[min(78dvh,28rem)] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+              className="relative z-[1] flex min-h-0 flex-1 flex-col"
+              style={{ perspective: '1400px' }}
             >
-              <div className="flex items-center justify-between border-b border-zinc-800/80 px-4 py-3">
-                <span className="text-[11px] font-medium uppercase tracking-[0.28em] text-zinc-400">
-                  {language === 'zh' ? '历史对话' : 'History'}
+              <div className="relative flex shrink-0 items-center justify-between px-5 pt-4 pb-2 md:px-8 md:pt-6">
+                <span className="text-[11px] font-medium uppercase tracking-[0.32em] text-zinc-500">
+                  {language === 'zh' ? '回忆长廊' : 'Memory hall'}
                 </span>
-                <button
-                  type="button"
-                  className="rounded-lg px-2 py-1 text-[11px] text-zinc-500 transition-colors hover:bg-zinc-900 hover:text-zinc-200"
-                  onClick={() => setShowHistoryModal(false)}
-                >
-                  {language === 'zh' ? '关闭' : 'Close'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="rounded-full border border-zinc-800/90 bg-zinc-950/80 px-4 py-2 text-[11px] font-medium uppercase tracking-wider text-zinc-300 backdrop-blur-md transition-colors hover:border-zinc-600 hover:text-zinc-100 touch-manipulation"
+                    onClick={() => {
+                      createNewSession();
+                      setShowHistoryModal(false);
+                    }}
+                  >
+                    {language === 'zh' ? '+ 新对话' : '+ New'}
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-full border border-zinc-800/90 px-3 py-2 text-[11px] text-zinc-500 transition-colors hover:bg-zinc-900/80 hover:text-zinc-200 touch-manipulation"
+                    onClick={() => setShowHistoryModal(false)}
+                  >
+                    {language === 'zh' ? '关闭' : 'Close'}
+                  </button>
+                </div>
               </div>
-              <div className="no-scrollbar flex-1 overflow-y-auto p-3">
-                <button
-                  type="button"
-                  className="mb-2 w-full rounded-xl border border-zinc-700/80 bg-zinc-900/50 py-3 text-[12px] font-medium text-zinc-200 transition-colors hover:border-zinc-500 touch-manipulation"
-                  onClick={() => {
-                    createNewSession();
-                    setShowHistoryModal(false);
-                  }}
-                >
-                  {language === 'zh' ? '+ 新对话' : '+ New chat'}
-                </button>
-                {sessions.length === 0 ? (
-                  <p className="py-8 text-center text-[13px] text-zinc-600">
+
+              <div
+                className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden"
+                onPointerDown={(e) => {
+                  if (e.pointerType === 'mouse' && e.button !== 0) return;
+                  historySwipeX0.current = e.clientX;
+                }}
+                onPointerUp={(e) => {
+                  const x0 = historySwipeX0.current;
+                  historySwipeX0.current = null;
+                  if (x0 == null || sortedHistorySessions.length < 2) return;
+                  const d = e.clientX - x0;
+                  if (d > 56) setHistorySlideIdx((i) => Math.max(0, i - 1));
+                  else if (d < -56) setHistorySlideIdx((i) => Math.min(sortedHistorySessions.length - 1, i + 1));
+                }}
+                onPointerCancel={() => {
+                  historySwipeX0.current = null;
+                }}
+              >
+                {sortedHistorySessions.length === 0 ? (
+                  <p className="relative z-[1] px-6 text-center text-[14px] text-zinc-500">
                     {language === 'zh' ? '暂无会话记录' : 'No sessions yet'}
                   </p>
                 ) : (
-                  <ul className="flex flex-col gap-1.5">
-                    {[...sessions]
-                      .sort((a, b) => b.updatedAt - a.updatedAt)
-                      .map((s) => (
-                        <li key={s.id}>
-                          <button
-                            type="button"
-                            className={`flex w-full flex-col items-start rounded-xl border px-3 py-2.5 text-left transition-colors touch-manipulation ${
-                              activeSessionId === s.id
-                                ? 'border-rose-500/40 bg-rose-950/20'
-                                : 'border-zinc-800 bg-zinc-900/30 hover:border-zinc-600'
-                            }`}
-                            onClick={() => {
-                              setActiveSessionId(s.id);
-                              setShowHistoryModal(false);
-                            }}
-                          >
-                            <span className="line-clamp-2 text-[13px] font-medium text-zinc-200">{s.theme}</span>
-                            <span className="mt-1 text-[10px] uppercase tracking-wider text-zinc-600">
-                              {new Date(s.updatedAt).toLocaleString()}
-                              {s.etchedToAlbum ? (language === 'zh' ? ' · 已镌刻' : ' · Saved') : ''}
-                            </span>
-                          </button>
-                        </li>
-                      ))}
-                  </ul>
+                  <>
+                    <div
+                      className="relative flex min-h-0 w-full flex-1 flex-col items-center justify-center overflow-hidden"
+                      style={{ perspective: '1200px' }}
+                    >
+                      <div
+                        className="relative flex min-h-0 w-full flex-1 items-center justify-center overflow-visible pb-2"
+                        style={{ perspective: 'inherit' }}
+                      >
+                        <div
+                          className="flex will-change-transform items-center gap-[30px] transition-[transform] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]"
+                          style={{
+                            transform: `translateX(calc(50vw - ${HISTORY_CARD_W / 2 + historySlideIdx * (HISTORY_CARD_W + HISTORY_CARD_GAP)}px))`,
+                          }}
+                        >
+                          {sortedHistorySessions.map((s, i) => {
+                            const d = i - historySlideIdx;
+                            const abs = Math.abs(d);
+                            const rotY = d * -11;
+                            const scale = Math.max(0.82, 1 - abs * 0.065);
+                            const z = -abs * 42;
+                            const opacity = abs > 2 ? 0.38 : 1;
+                            return (
+                              <div
+                                key={s.id}
+                                className="relative shrink-0"
+                                style={{
+                                  width: HISTORY_CARD_W,
+                                  transform: `rotateY(${rotY}deg) translateZ(${z}px) scale(${scale})`,
+                                  opacity,
+                                  zIndex: 50 - abs,
+                                  transformStyle: 'preserve-3d',
+                                  transition: 'transform 0.5s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.45s ease',
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  className={`group relative flex h-[min(52dvh,400px)] w-full flex-col overflow-hidden rounded-[1.35rem] border text-left shadow-[0_28px_90px_-24px_rgba(0,0,0,0.95)] touch-manipulation ${
+                                    activeSessionId === s.id
+                                      ? 'border-zinc-400/35 ring-1 ring-zinc-500/25'
+                                      : 'border-zinc-800/90 hover:border-zinc-600/80'
+                                  }`}
+                                  onClick={() => {
+                                    setActiveSessionId(s.id);
+                                    setShowHistoryModal(false);
+                                  }}
+                                >
+                                  {s.thumbnailDataUrl ? (
+                                    <img
+                                      src={s.thumbnailDataUrl}
+                                      alt=""
+                                      className="absolute inset-0 h-full w-full object-cover transition-transform duration-700 group-hover:scale-[1.04]"
+                                    />
+                                  ) : (
+                                    <div className="absolute inset-0 bg-gradient-to-br from-zinc-900 via-[#0a0a0c] to-black">
+                                      {[...Array(14)].map((_, k) => (
+                                        <span
+                                          key={k}
+                                          className="absolute rounded-full bg-white/15 shadow-[0_0_10px_rgba(255,255,255,0.12)] motion-safe:animate-pulse"
+                                          style={{
+                                            width: 2 + (k % 3),
+                                            height: 2 + (k % 3),
+                                            left: `${8 + (k * 37) % 88}%`,
+                                            top: `${12 + (k * 29) % 80}%`,
+                                            animationDelay: `${k * 0.15}s`,
+                                          }}
+                                        />
+                                      ))}
+                                    </div>
+                                  )}
+                                  <div className="absolute inset-0 bg-gradient-to-t from-black via-black/55 to-black/10" />
+                                  <div className="relative mt-auto flex flex-col gap-1.5 p-5 pt-16">
+                                    <h3 className="line-clamp-3 font-serif text-[1.05rem] italic leading-snug tracking-wide text-zinc-100 md:text-lg">
+                                      {s.theme}
+                                    </h3>
+                                    <p className="text-[10px] uppercase tracking-[0.28em] text-zinc-500">
+                                      {new Date(s.updatedAt).toLocaleString()}
+                                      {s.etchedToAlbum ? (language === 'zh' ? ' · 已镌刻' : ' · Saved') : ''}
+                                    </p>
+                                  </div>
+                                </button>
+                                <button
+                                  type="button"
+                                  className="absolute right-3 top-3 z-[3] flex h-10 w-10 items-center justify-center rounded-full border border-zinc-700/80 bg-black/55 text-zinc-400 backdrop-blur-md transition-colors hover:border-rose-900/50 hover:bg-rose-950/40 hover:text-rose-200 touch-manipulation"
+                                  aria-label={language === 'zh' ? '删除' : 'Delete'}
+                                  onClick={(ev) => {
+                                    ev.stopPropagation();
+                                    deleteSessionById(s.id);
+                                  }}
+                                >
+                                  <Trash2 className="h-4 w-4" strokeWidth={1.75} />
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="relative z-[4] flex shrink-0 justify-center gap-8 px-6 pb-2 pt-4">
+                      <button
+                        type="button"
+                        className="flex h-11 min-w-[3rem] items-center justify-center rounded-full border border-zinc-700/90 bg-zinc-950/90 px-5 text-lg leading-none text-zinc-300 shadow-lg backdrop-blur-md transition-colors hover:border-zinc-500 hover:text-zinc-50 touch-manipulation disabled:pointer-events-none disabled:opacity-25"
+                        disabled={historySlideIdx <= 0}
+                        aria-label={language === 'zh' ? '上一张' : 'Previous'}
+                        onClick={() => setHistorySlideIdx((i) => Math.max(0, i - 1))}
+                      >
+                        ‹
+                      </button>
+                      <button
+                        type="button"
+                        className="flex h-11 min-w-[3rem] items-center justify-center rounded-full border border-zinc-700/90 bg-zinc-950/90 px-5 text-lg leading-none text-zinc-300 shadow-lg backdrop-blur-md transition-colors hover:border-zinc-500 hover:text-zinc-50 touch-manipulation disabled:pointer-events-none disabled:opacity-25"
+                        disabled={historySlideIdx >= sortedHistorySessions.length - 1}
+                        aria-label={language === 'zh' ? '下一张' : 'Next'}
+                        onClick={() =>
+                          setHistorySlideIdx((i) => Math.min(sortedHistorySessions.length - 1, i + 1))
+                        }
+                      >
+                        ›
+                      </button>
+                    </div>
+                    <p className="relative z-[1] shrink-0 px-6 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1 text-center text-[10px] uppercase tracking-[0.28em] text-zinc-600">
+                      {language === 'zh' ? '左右滑动或按箭头翻阅 · 点卡片进入' : 'Swipe or use arrows · tap card to open'}
+                    </p>
+                  </>
                 )}
               </div>
             </div>

@@ -400,7 +400,7 @@ export default function App() {
   const [isHoveringSettings, setIsHoveringSettings] = useState(false);
   const [language, setLanguage] = useState<'zh' | 'en'>('zh');
   const [isAudioReactive, setIsAudioReactive] = useState(false);
-  const [isAutoSpeak, setIsAutoSpeak] = useState(() => localStorage.getItem('subconscious_auto_speak') === 'true');
+  const [isAutoSpeak, setIsAutoSpeak] = useState(() => localStorage.getItem('subconscious_auto_speak') !== 'false');
 
   /** 上传图像并选定：Live 语音 ↔ 文字+复刻音色，两条链路互斥 */
   const [conversationMode, setConversationMode] = useState<ConversationMode | null>(null);
@@ -449,9 +449,7 @@ export default function App() {
     setActiveVoiceProfileId(null);
     setClonedMinimaxVoiceId(null);
     setVoiceProfileTick((n) => n + 1);
-    setCloneVoiceHint(
-      language === 'zh' ? '已改用默认音色（.env 的 MINIMAX_VOICE_ID 或内置）。' : 'Using default voice from MINIMAX_VOICE_ID or built-in.',
-    );
+    setCloneVoiceHint(language === 'zh' ? '已改用内置默认音色。' : 'Using the built-in default voice.');
   }, [language]);
 
   const handleCloneAudioSelected = useCallback(
@@ -461,9 +459,7 @@ export default function App() {
       if (!file) return;
       if (!getMinimaxApiKey()) {
         setCloneVoiceHint(
-          language === 'zh'
-            ? '请先配置 MINIMAX_API_KEY（部署环境或 .env.local），保存后重新构建。'
-            : 'Set MINIMAX_API_KEY in your environment and redeploy (or .env.local for dev).',
+          language === 'zh' ? '当前无法使用声音复刻，请稍后再试或联系管理员。' : 'Voice cloning is unavailable right now.',
         );
         return;
       }
@@ -517,17 +513,16 @@ export default function App() {
           upsertVoiceProfile(voiceId);
           setClonedMinimaxVoiceId(voiceId);
           setVoiceProfileTick((n) => n + 1);
-          const idTail = voiceId.length > 14 ? `${voiceId.slice(0, 10)}…${voiceId.slice(-6)}` : voiceId;
           setCloneVoiceHint(
             language === 'zh'
-              ? `复刻成功。音色 ID（已保存，T2A 即用此 id）：${idTail}。开启「朗读回复」后，AI 将用你的音色说话。`
-              : `Clone ready. Voice ID (saved for T2A): ${idTail}. Turn on read responses to hear replies in your voice.`,
+              ? '复刻成功，已保存。开启「朗读回复」后，将用你的音色播报回复。'
+              : 'Voice saved. Turn on read responses to hear replies in your voice.',
           );
         } catch (err) {
           if (ac.signal.aborted) return;
-          const msg = String((err as Error)?.message || err);
+          console.warn('Voice clone failed', err);
           setCloneVoiceHint(
-            language === 'zh' ? `复刻失败：${msg.slice(0, 160)}` : `Clone failed: ${msg.slice(0, 160)}`,
+            language === 'zh' ? '复刻失败，请检查录音与网络后重试。' : 'Clone failed. Check your audio and network.',
           );
         } finally {
           if (cloneJobAbortRef.current === ac) cloneJobAbortRef.current = null;
@@ -967,11 +962,11 @@ export default function App() {
             <button
               type="button"
               onClick={() => setConversationMode('live')}
-              className="flex min-h-[52px] flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-zinc-700 bg-zinc-900/70 px-6 py-4 text-zinc-200 shadow-lg transition-colors hover:border-rose-500/40 hover:bg-zinc-800/80 touch-manipulation active:scale-[0.99]"
+              className="flex min-h-[52px] flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-zinc-700 bg-zinc-900/70 px-6 py-4 text-zinc-200 shadow-lg transition-colors hover:border-zinc-500 hover:bg-zinc-800/80 touch-manipulation active:scale-[0.99]"
             >
-              <Mic className="h-6 w-6 text-rose-400/90" strokeWidth={1.5} />
+              <Mic className="h-6 w-6 text-zinc-400" strokeWidth={1.5} />
               <span className="text-[11px] font-medium uppercase tracking-[0.22em]">
-                {language === 'zh' ? 'Live 语音对话' : 'Live voice'}
+                {language === 'zh' ? 'LIVE 模式' : 'Live mode'}
               </span>
             </button>
             <button
@@ -981,7 +976,7 @@ export default function App() {
             >
               <FileAudio className="h-6 w-6 text-zinc-400" strokeWidth={1.5} />
               <span className="text-[11px] font-medium uppercase tracking-[0.22em]">
-                {language === 'zh' ? '文字 + 复刻音色' : 'Text + clone'}
+                {language === 'zh' ? '声音克隆' : 'Voice clone'}
               </span>
             </button>
           </div>
@@ -1053,16 +1048,16 @@ export default function App() {
           {conversationMode !== null ? (
             <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 py-2.5 md:py-3">
               <div className="text-[10px] font-medium uppercase tracking-wider text-zinc-600">
-                {language === 'zh' ? '当前链路' : 'Mode'}
+                {language === 'zh' ? '当前模式' : 'Mode'}
               </div>
               <p className="mt-1 text-[12px] leading-snug text-zinc-300">
                 {conversationMode === 'live'
                   ? language === 'zh'
-                    ? 'Live 语音'
+                    ? '实时语音'
                     : 'Live voice'
                   : language === 'zh'
-                    ? '文字 + 复刻朗读'
-                    : 'Text + read-aloud'}
+                    ? '声音克隆'
+                    : 'Voice clone'}
               </p>
             </div>
           ) : null}
@@ -1105,15 +1100,8 @@ export default function App() {
 
           <div className="space-y-2 border-t border-zinc-900 pt-4 md:space-y-3 md:pt-4">
               <div className="text-xs font-medium uppercase tracking-widest text-zinc-500">
-                {language === 'zh' ? 'MiniMax 复刻音色' : 'MiniMax voice clone'}
+                {language === 'zh' ? '声音克隆' : 'Voice clone'}
               </div>
-              {!getMinimaxApiKey() ? (
-                <p className="rounded-lg border border-amber-900/40 bg-amber-950/30 px-2.5 py-2 text-[11px] leading-snug text-amber-100/90 md:text-[10px]">
-                  {language === 'zh'
-                    ? '若仍提示未检测：生产环境由启动脚本从 Render 的 Environment 注入密钥（见运行日志 [serve-render-dist]）。保存变量后重新部署；浏览器可强制刷新。本地开发仍用 .env.local + npm run dev。'
-                    : 'Production reads keys from Render Environment at server start (see [serve-render-dist] in logs). Redeploy after saving env vars; hard-refresh the browser. Local dev: .env.local + npm run dev.'}
-                </p>
-              ) : null}
               <input
                 ref={cloneAudioInputRef}
                 type="file"
@@ -1138,7 +1126,7 @@ export default function App() {
                     }}
                   >
                     <option value="">
-                      {language === 'zh' ? '默认（.env MINIMAX_VOICE_ID）' : 'Default (MINIMAX_VOICE_ID)'}
+                      {language === 'zh' ? '内置默认音色' : 'Built-in default'}
                     </option>
                     {voiceListForUi.map((p) => (
                       <option key={p.voiceId} value={p.voiceId}>
@@ -1178,8 +1166,8 @@ export default function App() {
               ) : (
                 <p className="text-[11px] leading-snug text-zinc-600 md:text-[10px]">
                   {language === 'zh'
-                    ? '当前没有已保存的复刻音色 ID。请固定用同一地址打开（例如始终用 http://localhost:5173，不要混用 127.0.0.1 或局域网 IP）；无痕模式、清除站点数据或换浏览器会清空。刷新同一标签页一般会保留，若仍丢失请检查是否上述原因。'
-                    : 'No saved voice IDs. Always use the same URL (e.g. stick to http://localhost:5173); mixing 127.0.0.1 or LAN IP uses separate storage. Private mode or clearing site data wipes data. Same-tab refresh should keep voices.'}
+                    ? '暂无已保存的复刻音色。请始终在同一浏览器、同一站点地址下使用；无痕模式或清除站点数据会导致记录丢失。'
+                    : 'No saved voices yet. Use the same browser and site address; private mode or clearing site data may erase saved voices.'}
                 </p>
               )}
               <div className="flex flex-wrap items-center gap-2">
