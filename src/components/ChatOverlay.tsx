@@ -412,6 +412,34 @@ function isLikelyGeminiRateLimitError(error: unknown): boolean {
   );
 }
 
+/** 免费层「每模型每日」等：再请求只会重复 429，应直接失败并提示用户 */
+function isGeminiDailyQuotaExhausted(error: unknown): boolean {
+  const raw = String((error as { message?: string })?.message ?? error ?? '');
+  return (
+    /GenerateRequestsPerDay/i.test(raw) ||
+    /PerDayPerProjectPerModel/i.test(raw) ||
+    /per day per project per model/i.test(raw)
+  );
+}
+
+/**
+ * Google 常在 429 JSON 里带 `Please retry in 12.3s` 或 RetryInfo `retryDelay`；应至少等到该时间再重试。
+ */
+function extractGeminiSuggestedRetryDelayMs(error: unknown): number | null {
+  const raw = String((error as { message?: string })?.message ?? error ?? '');
+  const m1 = /Please retry in ([\d.]+)\s*s\b/i.exec(raw);
+  if (m1) {
+    const sec = Number(m1[1]);
+    if (Number.isFinite(sec) && sec > 0) return Math.min(120_000, Math.ceil(sec * 1000) + 600);
+  }
+  const m2 = /"retryDelay"\s*:\s*"(\d+)s"/i.exec(raw);
+  if (m2) {
+    const sec = Number(m2[1]);
+    if (Number.isFinite(sec) && sec > 0) return Math.min(120_000, sec * 1000 + 600);
+  }
+  return null;
+}
+
 /**
  * 文本模型调用：503/404 等可换模型；429 仅在同一模型上退避，避免连打多个 endpoint 加重限流。
  */
@@ -434,8 +462,11 @@ async function geminiTextModelFallbackLoop<T>(params: {
         lastError = e;
         if (!isGeminiModelFallbackError(e)) throw e;
         if (isLikelyGeminiRateLimitError(e)) {
+          if (isGeminiDailyQuotaExhausted(e)) throw e;
           if (attempt >= GEMINI_RATE_LIMIT_MAX_TRIES - 1) break outer;
-          await sleepMs(GEMINI_RATE_LIMIT_BACKOFF_MS[attempt] ?? 20000);
+          const hintMs = extractGeminiSuggestedRetryDelayMs(e);
+          const floorMs = GEMINI_RATE_LIMIT_BACKOFF_MS[attempt] ?? 20000;
+          await sleepMs(Math.max(floorMs, hintMs ?? 0));
           attempt += 1;
           continue;
         }
@@ -678,6 +709,11 @@ function formatProviderChatError(
     lower.includes('exceeded your current quota') ||
     lower.includes('rate limit')
   ) {
+    if (isGeminiDailyQuotaExhausted({ message: raw })) {
+      return lang === 'zh'
+        ? '当前模型今日免费调用次数已用完，请明日再试或在 Google AI Studio 查看计费与额度。'
+        : 'Daily free-tier limit for this model is reached. Try tomorrow or check quotas in Google AI Studio.';
+    }
     return lang === 'zh' ? quotaHint.zh : quotaHint.en;
   }
   if (raw.length > 280) {
