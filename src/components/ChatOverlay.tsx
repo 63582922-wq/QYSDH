@@ -55,13 +55,24 @@ export interface ChatOverlayHandle {
 /**
  * SDK 默认 baseUrl 带尾部 `/`，Live 侧拼 `${wsBase}/ws/...` 会得到 `…googleapis.com//ws/…`，握手可能失败。
  * 使用无尾部斜杠的 origin。
+ *
+ * 懒创建：生产环境由 `serve-render-dist` 在 HTML 最前注入 `__RUNTIME_APP_ENV__`，若模块早于注入执行，
+ * 首次会得到空 Key；注入后再次调用须换新实例（按 key 缓存失效）。
  */
-const ai = new GoogleGenAI({
-  apiKey: getGeminiApiKey(),
-  httpOptions: {
-    baseUrl: 'https://generativelanguage.googleapis.com',
-  },
-});
+let geminiClientCache: GoogleGenAI | null = null;
+let geminiClientCacheKey = '';
+function getGeminiClient(): GoogleGenAI {
+  const k = getGeminiApiKey();
+  if (geminiClientCache && geminiClientCacheKey === k) return geminiClientCache;
+  geminiClientCacheKey = k;
+  geminiClientCache = new GoogleGenAI({
+    apiKey: k,
+    httpOptions: {
+      baseUrl: 'https://generativelanguage.googleapis.com',
+    },
+  });
+  return geminiClientCache;
+}
 
 if (!getGeminiApiKey()) {
   console.error('CRITICAL: GEMINI_API_KEY is not defined in environment!');
@@ -1449,7 +1460,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     for (let i = 0; i < list.length; i += 1) {
       const model = list[i];
       try {
-        const result = await ai.models.generateContent({
+        const result = await getGeminiClient().models.generateContent({
           model,
           contents,
           config,
@@ -1812,7 +1823,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       for (let i = 0; i < modelList.length; i += 1) {
         const model = modelList[i];
         try {
-          const chat = ai.chats.create({
+          const chat = getGeminiClient().chats.create({
             model,
             config: {
               systemInstruction,
@@ -2524,12 +2535,12 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         muteOut.connect(audioContext.destination);
 
         // Gemini Multimodal Live（固定 `LIVE_VOICE_MODEL_ID`，不再多模型回退）
-        let session: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
+        let session: Awaited<ReturnType<GoogleGenAI['live']['connect']>> | null = null;
         let lastLiveConnectError: unknown = null;
         const liveModel = LIVE_VOICE_MODEL_ID;
         try {
             const connectGen = ++liveVoiceSessionGenRef.current;
-            const sessionPromise = ai.live.connect({
+            const sessionPromise = getGeminiClient().live.connect({
               model: liveModel,
               callbacks: {
                 onopen: async () => {
@@ -3623,6 +3634,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         </div>
 
       </div>
+    </div>
 
       {isOpen && conversationMode === 'text_clone' && !allowLiveVoice && !settingsChromeOpen
         ? createPortal(
@@ -3884,7 +3896,6 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         </div>,
         document.body,
         )}
-    </div>
     {voiceBlockingMessage &&
       createPortal(
         <div className="fixed inset-0 z-[10001] flex items-center justify-center bg-black/75 p-6 backdrop-blur-md pointer-events-auto pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
