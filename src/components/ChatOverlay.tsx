@@ -362,7 +362,14 @@ function extractGeminiHttpStatus(error: unknown): number | undefined {
 /** 同一模型上瞬时 503 时的退避次数（仍会再换候选模型） */
 const GEMINI_MODEL_ATTEMPTS = 2;
 /** 换模型前多等一会，减轻对同一 endpoint 的连打 */
-const GEMINI_MODEL_SWITCH_GAP_MS = 750;
+const GEMINI_MODEL_SWITCH_GAP_MS = 1200;
+/** 429 / 配额类：通常按 API Key 限流，换模型会继续打满配额；只在当前模型上长退避重试，然后结束 */
+const GEMINI_RATE_LIMIT_MAX_TRIES = 4;
+const GEMINI_RATE_LIMIT_BACKOFF_MS = [2800, 7000, 14000, 20000] as const;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((r) => window.setTimeout(r, ms));
+}
 
 /** 可换下一候选模型重试：404 类 + 瞬时过载/配额（503/429 等），避免一次 UNAVAILABLE 就整轮失败 */
 function isGeminiModelFallbackError(error: unknown): boolean {
@@ -390,6 +397,58 @@ function isGeminiModelFallbackError(error: unknown): boolean {
     u.includes('"CODE":503') ||
     u.includes('"CODE":429')
   );
+}
+
+/** 与 503 区分：限流/配额在同一密钥下换模型往往无效，不应快速遍历候选模型 */
+function isLikelyGeminiRateLimitError(error: unknown): boolean {
+  const http = extractGeminiHttpStatus(error);
+  if (http === 429) return true;
+  const raw = String((error as { message?: string })?.message ?? error ?? '').toUpperCase();
+  return (
+    raw.includes('RESOURCE_EXHAUSTED') ||
+    raw.includes('TOO_MANY_REQUESTS') ||
+    raw.includes('"CODE":429') ||
+    raw.includes('429 TOO MANY REQUESTS')
+  );
+}
+
+/**
+ * 文本模型调用：503/404 等可换模型；429 仅在同一模型上退避，避免连打多个 endpoint 加重限流。
+ */
+async function geminiTextModelFallbackLoop<T>(params: {
+  candidates: readonly string[];
+  run: (model: string) => Promise<T>;
+  onSuccessModel: (model: string) => void;
+}): Promise<T> {
+  const { candidates, run, onSuccessModel } = params;
+  let lastError: unknown = null;
+  outer: for (let i = 0; i < candidates.length; i += 1) {
+    const model = candidates[i]!;
+    let attempt = 0;
+    while (true) {
+      try {
+        const r = await run(model);
+        onSuccessModel(model);
+        return r;
+      } catch (e) {
+        lastError = e;
+        if (!isGeminiModelFallbackError(e)) throw e;
+        if (isLikelyGeminiRateLimitError(e)) {
+          if (attempt >= GEMINI_RATE_LIMIT_MAX_TRIES - 1) break outer;
+          await sleepMs(GEMINI_RATE_LIMIT_BACKOFF_MS[attempt] ?? 20000);
+          attempt += 1;
+          continue;
+        }
+        if (attempt >= GEMINI_MODEL_ATTEMPTS - 1) break;
+        await sleepMs(1200 + attempt * 900);
+        attempt += 1;
+        continue;
+      }
+    }
+    if (lastError != null && isLikelyGeminiRateLimitError(lastError)) break outer;
+    if (i < candidates.length - 1) await sleepMs(GEMINI_MODEL_SWITCH_GAP_MS);
+  }
+  throw lastError ?? new Error('No available text model');
 }
 
 /** Short user-facing text; avoids dumping huge JSON (e.g. quota / 429). */
@@ -1632,37 +1691,17 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     );
   };
 
-  const sleepMs = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
-
   const generateWithFallback = async (contents: any[], config?: any) => {
-    let lastError: any = null;
-    const list = [...TEXT_MODEL_CANDIDATES];
-    outer: for (let i = 0; i < list.length; i += 1) {
-      const model = list[i]!;
-      for (let attempt = 0; attempt < GEMINI_MODEL_ATTEMPTS; attempt += 1) {
-        try {
-          const result = await getGeminiClient().models.generateContent({
-            model,
-            contents,
-            config,
-          });
-          setActiveTextModel(model);
-          return result;
-        } catch (e) {
-          lastError = e;
-          if (!isGeminiModelFallbackError(e)) {
-            throw e;
-          }
-          if (attempt < GEMINI_MODEL_ATTEMPTS - 1) {
-            await sleepMs(900 + attempt * 700);
-          }
-        }
-      }
-      if (i < list.length - 1) {
-        await sleepMs(GEMINI_MODEL_SWITCH_GAP_MS);
-      }
-    }
-    throw lastError || new Error('No available text model');
+    return geminiTextModelFallbackLoop({
+      candidates: TEXT_MODEL_CANDIDATES,
+      onSuccessModel: setActiveTextModel,
+      run: (model) =>
+        getGeminiClient().models.generateContent({
+          model,
+          contents,
+          config,
+        }),
+    });
   };
 
   /** Live 字幕中英对照：单行译文，失败则返回空串（仅回合结束后调用，不在流式过程中打 REST，减轻 503/配额争抢） */
@@ -2042,48 +2081,28 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
           ? getCloneCounselorSystemInstruction()
           : getLiveCompanionSystemInstruction();
 
-      let response: any = null;
-      let lastModelError: any = null;
-      const modelList = [...TEXT_MODEL_CANDIDATES];
-      outer: for (let i = 0; i < modelList.length; i += 1) {
-        const model = modelList[i]!;
-        for (let attempt = 0; attempt < GEMINI_MODEL_ATTEMPTS; attempt += 1) {
-          try {
-            const chat = getGeminiClient().chats.create({
-              model,
-              config: {
-                systemInstruction,
-                temperature: 0.88,
-                topP: 0.92,
-                topK: 40,
-              },
-              history: history.length > 0 ? history : undefined,
-            });
-            response = await Promise.race([
-              chat.sendMessage({ message: contents }),
-              new Promise<never>((_, reject) => {
-                window.setTimeout(() => reject(new Error('CLIENT_TIMEOUT')), CHAT_SEND_TIMEOUT_MS);
-              }),
-            ]);
-            setActiveTextModel(model);
-            break outer;
-          } catch (e) {
-            lastModelError = e;
-            if (!isGeminiModelFallbackError(e)) {
-              throw e;
-            }
-            if (attempt < GEMINI_MODEL_ATTEMPTS - 1) {
-              await sleepMs(900 + attempt * 700);
-            }
-          }
-        }
-        if (i < modelList.length - 1) {
-          await sleepMs(GEMINI_MODEL_SWITCH_GAP_MS);
-        }
-      }
-      if (!response) {
-        throw lastModelError || new Error('No available chat model');
-      }
+      const response = await geminiTextModelFallbackLoop({
+        candidates: TEXT_MODEL_CANDIDATES,
+        onSuccessModel: setActiveTextModel,
+        run: (model) => {
+          const chat = getGeminiClient().chats.create({
+            model,
+            config: {
+              systemInstruction,
+              temperature: 0.88,
+              topP: 0.92,
+              topK: 40,
+            },
+            history: history.length > 0 ? history : undefined,
+          });
+          return Promise.race([
+            chat.sendMessage({ message: contents }),
+            new Promise<never>((_, reject) => {
+              window.setTimeout(() => reject(new Error('CLIENT_TIMEOUT')), CHAT_SEND_TIMEOUT_MS);
+            }),
+          ]);
+        },
+      });
 
       const aiMessage: ChatMessage = {
         role: 'model',
