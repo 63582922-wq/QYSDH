@@ -954,6 +954,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneHoldCleanupStopRef = useRef(false);
   /** 已开始识别、等待用户第二次点按「完成」；用于 WebKit 过早 onend 时重开识别 */
   const cloneAwaitingStopTapRef = useRef(false);
+  /** 听写 interim 极高频：合并为每帧至多一次 setState，避免主线程被 React 重绘占满（体感「卡死」） */
+  const cloneCaptionFlushRafRef = useRef<number | null>(null);
   /** 点按说话：字幕与声纹同步，不写输入框 */
   const [cloneLiveCaptionUserLine, setCloneLiveCaptionUserLine] = useState('');
   const [cloneUserPostDictationHold, setCloneUserPostDictationHold] = useState(false);
@@ -2298,6 +2300,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       return false;
     }
     setCloneLiveCaptionUserLine('');
+    if (cloneCaptionFlushRafRef.current != null) {
+      cancelAnimationFrame(cloneCaptionFlushRafRef.current);
+      cloneCaptionFlushRafRef.current = null;
+    }
     type SRCtor = new () => SpeechRecognition;
     const w = window as Window & { SpeechRecognition?: SRCtor; webkitSpeechRecognition?: SRCtor };
     const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
@@ -2326,11 +2332,15 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             interim += r[0]?.transcript ?? '';
           }
         }
-        const mid = cloneDictationAccumRef.current.trim();
-        const tail = interim.trim();
-        cloneDictationInterimRef.current = tail;
-        const line = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
-        setCloneLiveCaptionUserLine(line);
+        cloneDictationInterimRef.current = interim.trim();
+        if (cloneCaptionFlushRafRef.current != null) return;
+        cloneCaptionFlushRafRef.current = requestAnimationFrame(() => {
+          cloneCaptionFlushRafRef.current = null;
+          const mid = cloneDictationAccumRef.current.trim();
+          const tail = cloneDictationInterimRef.current.trim();
+          const line = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
+          setCloneLiveCaptionUserLine(line);
+        });
       };
 
       rec.onerror = (ev: SpeechRecognitionErrorEvent) => {
@@ -2340,6 +2350,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         }
         cloneHoldOutcomeRef.current = null;
         cloneAwaitingStopTapRef.current = false;
+        if (cloneCaptionFlushRafRef.current != null) {
+          cancelAnimationFrame(cloneCaptionFlushRafRef.current);
+          cloneCaptionFlushRafRef.current = null;
+        }
         setInputText(cloneHoldSnapshotRef.current.trim());
         setCloneLiveCaptionUserLine('');
         cloneDictationAccumRef.current = '';
@@ -2362,6 +2376,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       };
 
       rec.onend = () => {
+        if (cloneCaptionFlushRafRef.current != null) {
+          cancelAnimationFrame(cloneCaptionFlushRafRef.current);
+          cloneCaptionFlushRafRef.current = null;
+        }
         if (cloneHoldCleanupStopRef.current) {
           cloneDictationRecognitionRef.current = null;
           setIsCloneDictating(false);
@@ -2734,12 +2752,20 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
      }
 
      try {
+         /** Android Chrome（含华为机型）也常忽略固定 sampleRate；重采样逻辑见 appendLiveMicSamplesForWebSocket */
          const ACtor = window.AudioContext || (window as any).webkitAudioContext;
          let audioContext: AudioContext;
          try {
-           audioContext = new ACtor({ sampleRate: LIVE_GEMINI_INPUT_RATE });
+           audioContext = new ACtor({
+             sampleRate: LIVE_GEMINI_INPUT_RATE,
+             latencyHint: 'interactive',
+           });
          } catch {
-           audioContext = new ACtor();
+           try {
+             audioContext = new ACtor({ latencyHint: 'interactive' });
+           } catch {
+             audioContext = new ACtor();
+           }
          }
          liveMicActualSampleRateRef.current = audioContext.sampleRate;
          audioContextRef.current = audioContext;
@@ -3185,6 +3211,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const stopCloneDictation = useCallback(
     (opts?: { cleanup?: boolean }) => {
+      if (cloneCaptionFlushRafRef.current != null) {
+        cancelAnimationFrame(cloneCaptionFlushRafRef.current);
+        cloneCaptionFlushRafRef.current = null;
+      }
       const r = cloneDictationRecognitionRef.current;
       if (opts?.cleanup) {
         cloneHoldCleanupStopRef.current = true;
@@ -3286,6 +3316,9 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     let cancelled = false;
     const W = VOICEPRINT_CANVAS_W;
     const H = VOICEPRINT_CANVAS_H;
+    /** 复刻听写时降频画声纹（仍用同一套 RMS）；减轻与 SpeechRecognition 抢主线程 */
+    const CLONE_VOICERPRINT_MIN_INTERVAL_MS = 52;
+    let cloneVoiceprintLastDrawMs = 0;
 
     const boot = () => {
       if (cancelled) return;
@@ -3346,6 +3379,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             voiceprintRafRef.current = requestAnimationFrame(boot);
             scheduledReboot = true;
             return;
+          }
+          if (cloneMic) {
+            const tNow = performance.now();
+            if (tNow - cloneVoiceprintLastDrawMs < CLONE_VOICERPRINT_MIN_INTERVAL_MS) {
+              voiceprintRafRef.current = requestAnimationFrame(loop);
+              return;
+            }
+            cloneVoiceprintLastDrawMs = tNow;
           }
           an.getByteFrequencyData(freqBuf);
           let rawE: number;
