@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, forwardRef, useImperativeHandle } from 'react';
 import { createPortal } from 'react-dom';
+import { getAppPortalNode } from '../portalRoot';
 import { Send, Loader2, Mic, MicOff, Dna, RefreshCw, Save, Trash2 } from 'lucide-react';
 import { GoogleGenAI, Type, LiveServerMessage, Modality } from '@google/genai';
 import { getGeminiApiKey, getGeminiLiveSpeechVoiceNameFromRuntimeOrDefine } from '../appClientEnv';
@@ -718,6 +719,15 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     }
   }, []);
   const [voiceBlockingMessage, setVoiceBlockingMessage] = useState<string | null>(null);
+
+  /** 对话层关闭时收起所有 Portal 弹层，避免 isOpen 已 false 仍保留状态导致下一帧与 DOM 不一致（insertBefore 报错） */
+  useEffect(() => {
+    if (isOpen) return;
+    setShowHistoryModal(false);
+    setShowSavePreview(false);
+    setVoiceBlockingMessage(null);
+  }, [isOpen]);
+
   /** 改 session 音色后强制重渲染（sessionStorage 本身不触发 React） */
   const [, setLiveVoiceRevision] = useState(0);
   const [liveVoiceSwitchHint, setLiveVoiceSwitchHint] = useState('');
@@ -3963,7 +3973,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                 {showOverlayToolbar ? overlaySaveBtn : null}
               </div>
             </div>,
-            document.body,
+            getAppPortalNode(),
           )
         : null}
 
@@ -3987,7 +3997,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                 {overlaySaveBtn}
               </div>
             </div>,
-            document.body,
+            getAppPortalNode(),
           )
         : null}
 
@@ -4185,7 +4195,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
               </div>
             </div>
           </div>,
-          document.body,
+          getAppPortalNode(),
         )}
 
       {/* Save Preview Modal — Portal 到 body，避免被父级 stacking 压在设置按钮下面 */}
@@ -4321,7 +4331,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             </div>
           </div>
         </div>,
-        document.body,
+        getAppPortalNode(),
         )}
     {voiceBlockingMessage &&
       createPortal(
@@ -4341,7 +4351,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             </button>
           </div>
         </div>,
-        document.body,
+        getAppPortalNode(),
       )}
     </>
   );
