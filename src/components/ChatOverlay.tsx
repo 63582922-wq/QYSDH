@@ -956,6 +956,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneAwaitingStopTapRef = useRef(false);
   /** 听写 interim 极高频：合并为每帧至多一次 setState，避免主线程被 React 重绘占满（体感「卡死」） */
   const cloneCaptionFlushRafRef = useRef<number | null>(null);
+  /** 第二次点「完成」后延迟 stop，给 Chrome/Android 派发最后一条 final onresult 的时间，避免空文本不发送 */
+  const cloneDictationStopTimerRef = useRef<number | null>(null);
   /** 点按说话：字幕与声纹同步，不写输入框 */
   const [cloneLiveCaptionUserLine, setCloneLiveCaptionUserLine] = useState('');
   const [cloneUserPostDictationHold, setCloneUserPostDictationHold] = useState(false);
@@ -998,6 +1000,17 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       setCloneUserPostDictationHold(false);
       setCloneUserPostDictationEcho('');
     }, CLONE_USER_POST_DICTATION_HOLD_MS);
+  }, []);
+
+  /** 取消待合并的 rAF，立刻把 accum/interim ref 同步到字幕 state（完成点按 / onend 前用，避免漏字） */
+  const flushCloneCaptionFromRefs = useCallback(() => {
+    if (cloneCaptionFlushRafRef.current != null) {
+      cancelAnimationFrame(cloneCaptionFlushRafRef.current);
+      cloneCaptionFlushRafRef.current = null;
+    }
+    const mid = cloneDictationAccumRef.current.trim();
+    const tail = cloneDictationInterimRef.current.trim();
+    setCloneLiveCaptionUserLine([mid, tail].filter((x) => x.length > 0).join(' ').trim());
   }, []);
 
   const stopCloneUserMicCapture = useCallback(() => {
@@ -1156,7 +1169,11 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       if (cloneTtsPostSpeechHold) {
         aiMain = lastModel;
       } else if (ttsStreaming) {
-        aiMain = lastModel.slice(0, cloneTtsRevealLen);
+        const cap =
+          Number.isFinite(cloneTtsRevealLen) && cloneTtsRevealLen >= 0
+            ? Math.min(lastModel.length, cloneTtsRevealLen)
+            : 0;
+        aiMain = lastModel.slice(0, cap);
       } else if (!isAutoSpeak) {
         aiMain = lastModel;
       }
@@ -2083,9 +2100,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
   };
 
   const sendMessage = async (opts?: { textOverride?: string; preserveInputFromVoiceHold?: boolean }) => {
-    const trimmedField = inputText.trim();
+    const trimmedField = typeof inputText === 'string' ? inputText.trim() : String(inputText ?? '').trim();
     const overrideRaw = opts?.textOverride;
-    const effectiveUserText = overrideRaw !== undefined ? overrideRaw.trim() : trimmedField;
+    const effectiveUserText =
+      overrideRaw !== undefined
+        ? typeof overrideRaw === 'string'
+          ? overrideRaw.trim()
+          : String(overrideRaw ?? '').trim()
+        : trimmedField;
 
     if (!effectiveUserText) return;
     
@@ -2300,6 +2322,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       return false;
     }
     setCloneLiveCaptionUserLine('');
+    if (cloneDictationStopTimerRef.current != null) {
+      window.clearTimeout(cloneDictationStopTimerRef.current);
+      cloneDictationStopTimerRef.current = null;
+    }
     if (cloneCaptionFlushRafRef.current != null) {
       cancelAnimationFrame(cloneCaptionFlushRafRef.current);
       cloneCaptionFlushRafRef.current = null;
@@ -2347,6 +2373,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         /** no-speech / aborted 为常见无害事件，勿打成 warn 以免误以为整条语音链路故障 */
         if (ev.error !== 'no-speech' && ev.error !== 'aborted') {
           console.warn('[Clone dictation]', ev.error);
+        }
+        if (cloneDictationStopTimerRef.current != null) {
+          window.clearTimeout(cloneDictationStopTimerRef.current);
+          cloneDictationStopTimerRef.current = null;
         }
         cloneHoldOutcomeRef.current = null;
         cloneAwaitingStopTapRef.current = false;
@@ -2413,6 +2443,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         const oc = outcome;
         cloneHoldOutcomeRef.current = null;
         cloneAwaitingStopTapRef.current = false;
+
+        if (oc === 'send') {
+          flushCloneCaptionFromRefs();
+        }
 
         if (oc == null) {
           setCloneLiveCaptionUserLine('');
@@ -3211,6 +3245,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const stopCloneDictation = useCallback(
     (opts?: { cleanup?: boolean }) => {
+      if (cloneDictationStopTimerRef.current != null) {
+        window.clearTimeout(cloneDictationStopTimerRef.current);
+        cloneDictationStopTimerRef.current = null;
+      }
       if (cloneCaptionFlushRafRef.current != null) {
         cancelAnimationFrame(cloneCaptionFlushRafRef.current);
         cloneCaptionFlushRafRef.current = null;
@@ -3239,12 +3277,19 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     if (conversationMode !== 'text_clone' || isTyping) return;
 
     if (isCloneDictating) {
+      if (cloneDictationStopTimerRef.current != null) {
+        return;
+      }
       if (!cloneDictationRecognitionRef.current) {
         stopCloneDictation();
         return;
       }
+      flushCloneCaptionFromRefs();
       cloneHoldOutcomeRef.current = 'send';
-      stopCloneDictation();
+      cloneDictationStopTimerRef.current = window.setTimeout(() => {
+        cloneDictationStopTimerRef.current = null;
+        stopCloneDictation();
+      }, 170);
       return;
     }
 
