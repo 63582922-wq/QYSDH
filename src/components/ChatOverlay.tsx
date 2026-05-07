@@ -3236,15 +3236,26 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       canvas.width = W;
       canvas.height = H;
       const ctx = canvas.getContext('2d');
-      if (!ctx) return;
+      if (!ctx) {
+        /** 移动端 WebKit 偶发首帧拿不到 2d（内存或未就绪），勿静默 return 否则永不进入 loop */
+        voiceprintRafRef.current = requestAnimationFrame(boot);
+        return;
+      }
       ctx.fillStyle = '#000000';
       ctx.fillRect(0, 0, W, H);
 
-      const freqBuf = new Uint8Array(analyser.frequencyBinCount);
-      const tdBuf = new Float32Array(analyser.fftSize);
+      const binCount = analyser.frequencyBinCount;
+      const fftN = analyser.fftSize;
+      if (!binCount || !fftN) {
+        voiceprintRafRef.current = requestAnimationFrame(boot);
+        return;
+      }
+      const freqBuf = new Uint8Array(binCount);
+      const tdBuf = new Float32Array(fftN);
 
       const loop = () => {
         if (cancelled) return;
+        let scheduledReboot = false;
         try {
           const cv = voiceprintCanvasRef.current;
           if (!cv || cv.width !== W || cv.height !== H) {
@@ -3252,12 +3263,20 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             return;
           }
           const c = cv.getContext('2d');
-          if (!c) return;
+          if (!c) {
+            voiceprintRafRef.current = requestAnimationFrame(loop);
+            return;
+          }
           const cloneMic =
             conversationModeRef.current === 'text_clone' && isCloneDictating;
           const an = cloneMic ? cloneUserMicAnalyserRef.current : liveVoiceAnalyserRef.current;
           if (!an) {
             voiceprintRafRef.current = requestAnimationFrame(loop);
+            return;
+          }
+          if (an.frequencyBinCount !== freqBuf.length || an.fftSize !== tdBuf.length) {
+            voiceprintRafRef.current = requestAnimationFrame(boot);
+            scheduledReboot = true;
             return;
           }
           an.getByteFrequencyData(freqBuf);
@@ -3276,7 +3295,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         } catch (e) {
           console.warn('[Voiceprint user]', e);
         }
-        voiceprintRafRef.current = requestAnimationFrame(loop);
+        if (!scheduledReboot) voiceprintRafRef.current = requestAnimationFrame(loop);
       };
 
       voiceprintRafRef.current = requestAnimationFrame(loop);
@@ -3347,7 +3366,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       canvas.width = W;
       canvas.height = H;
       const ctx = canvas.getContext('2d');
-      if (!ctx) return;
+      if (!ctx) {
+        voiceprintAiRafRef.current = requestAnimationFrame(boot);
+        return;
+      }
       ctx.fillStyle = '#000000';
       ctx.fillRect(0, 0, W, H);
 
