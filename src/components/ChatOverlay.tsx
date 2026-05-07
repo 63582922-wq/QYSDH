@@ -78,9 +78,20 @@ if (!getGeminiApiKey()) {
   console.error('CRITICAL: GEMINI_API_KEY is not defined in environment!');
 }
 
-/** 固定：文本多轮（含复刻）、主题、镌刻等；不再链式回退其它模型 ID。 */
+/**
+ * 文本多轮（含复刻）、主题、镌刻等；主模型 503 时按序尝试备用。
+ * 注意：`gemini-1.5-flash` 无版本后缀在 v1beta 上常直接 404（并非没开通），须用 `…-8b` / `…-002` 等 ListModels 里可见的全名。
+ * `gemini-2.0-flash` 对部分密钥/区域也可能 404，故优先 2.5 同族与 1.5 带版本号、再 3.x 预览。
+ * @see https://ai.google.dev/gemini-api/docs/models
+ */
 const TEXT_MODEL_ID = 'gemini-2.5-flash';
-const TEXT_MODEL_CANDIDATES = [TEXT_MODEL_ID];
+const TEXT_MODEL_CANDIDATES = [
+  TEXT_MODEL_ID,
+  'gemini-2.5-flash-lite',
+  'gemini-1.5-flash-8b',
+  'gemini-1.5-flash-002',
+  'gemini-3-flash-preview',
+] as const;
 
 /**
  * 固定：Gemini Multimodal Live（bidi），与 AI Studio「Gemini 3 Flash Live」一致。
@@ -324,20 +335,42 @@ const isModelNotFoundError = (error: any) => {
   return message.includes('not found') || message.includes('is not supported');
 };
 
+/**
+ * `@google/genai` 的 `ApiError` 带 `status`（HTTP 码）；`message` 也可能是整段 JSON 字符串。
+ * 任一路径取到 4xx/5xx 即返回，供过载时换模型 / 退避重试。
+ */
+function extractGeminiHttpStatus(error: unknown): number | undefined {
+  const x = error as { status?: number; code?: number; message?: string };
+  if (typeof x.status === 'number' && x.status >= 400) return x.status;
+  if (typeof x.code === 'number' && x.code >= 400 && x.code < 600) return x.code;
+  const raw = String(x.message ?? error ?? '');
+  try {
+    const j = JSON.parse(raw) as { error?: { code?: number } };
+    const c = j?.error?.code;
+    if (typeof c === 'number' && c >= 400 && c < 600) return c;
+  } catch {
+    /* message 非纯 JSON 时走正则 */
+  }
+  const m = /"code"\s*:\s*(\d{3})\b/.exec(raw);
+  if (m) return Number(m[1]);
+  return undefined;
+}
+
+/** 同一模型上瞬时 503 时的退避次数（仍会再换候选模型） */
+const GEMINI_MODEL_ATTEMPTS = 2;
+/** 换模型前多等一会，减轻对同一 endpoint 的连打 */
+const GEMINI_MODEL_SWITCH_GAP_MS = 750;
+
 /** 可换下一候选模型重试：404 类 + 瞬时过载/配额（503/429 等），避免一次 UNAVAILABLE 就整轮失败 */
 function isGeminiModelFallbackError(error: unknown): boolean {
-  if (isModelNotFoundError(error)) return true;
   if (String((error as { message?: string })?.message) === 'CLIENT_TIMEOUT') return true;
 
-  const x = error as {
-    status?: number;
-    code?: number;
-    message?: string;
-    error?: { code?: number; message?: string; status?: string };
-  };
-  const code = x?.status ?? x?.code ?? x?.error?.code;
-  if (code === 503 || code === 429) return true;
+  const http = extractGeminiHttpStatus(error);
+  if (http === 503 || http === 429 || http === 404) return true;
 
+  if (isModelNotFoundError(error)) return true;
+
+  const x = error as { message?: string; error?: { message?: string } };
   const raw = String(x?.message ?? x?.error?.message ?? error ?? '');
   try {
     const j = JSON.parse(raw) as { error?: { code?: number } };
@@ -513,6 +546,33 @@ function formatProviderChatError(
   const lower = raw.toLowerCase();
   if (raw === 'CLIENT_TIMEOUT' || lower === 'client_timeout') {
     return lang === 'zh' ? '请求超时，请检查网络后重试。' : 'Request timed out. Check your network and retry.';
+  }
+  /** 与配额 429 区分：503 / UNAVAILABLE / high demand 多为 Google 侧瞬时高峰 */
+  const overload =
+    lower.includes('high demand') ||
+    lower.includes('unavailable') ||
+    lower.includes('service unavailable') ||
+    /"code"\s*:\s*503/.test(raw) ||
+    raw.includes('"code":503');
+  if (overload && !lower.includes('quota') && !lower.includes('resource_exhausted')) {
+    return lang === 'zh'
+      ? 'Google 生成服务暂时繁忙（高峰常见）。应用已依次尝试多个模型；若仍失败请隔几分钟再试，与本地麦克风无关。'
+      : 'Google’s model is temporarily overloaded (common during spikes). We tried fallbacks; wait a few minutes and retry. This is not your microphone.';
+  }
+  if (lower.includes('reported as leaked') || lower.includes('use another api key')) {
+    return lang === 'zh'
+      ? 'Google 已禁用当前 GEMINI_API_KEY（判定为泄露，与代码无关）。请到 Google AI Studio 吊销该密钥并新建，仅写入本机 .env.local 或托管平台私密环境变量，勿提交到 Git；改后重启 dev / 重新部署。'
+      : 'Google disabled this GEMINI_API_KEY (reported leaked—not an app bug). Revoke and create a new key in Google AI Studio; store only in .env.local or host secrets, never in Git; restart dev or redeploy.';
+  }
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not found') ||
+    lower.includes('pass a valid api key') ||
+    (lower.includes('invalid_argument') && lower.includes('api key'))
+  ) {
+    return lang === 'zh'
+      ? 'Gemini 未接受当前密钥（无效或未带上）。请检查 .env.local 里 GEMINI_API_KEY 是否整段复制、无多余空格/换行；不要用中文引号包裹；保存后强刷或执行 npm run start:fresh。'
+      : 'Gemini rejected the key (missing/invalid). Check GEMINI_API_KEY in .env.local—full copy, no extra spaces/newlines; hard-refresh or npm run start:fresh.';
   }
   if (
     raw.includes('429') ||
@@ -1461,25 +1521,30 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 
   const generateWithFallback = async (contents: any[], config?: any) => {
     let lastError: any = null;
-    const list = TEXT_MODEL_CANDIDATES;
-    for (let i = 0; i < list.length; i += 1) {
-      const model = list[i];
-      try {
-        const result = await getGeminiClient().models.generateContent({
-          model,
-          contents,
-          config,
-        });
-        setActiveTextModel(model);
-        return result;
-      } catch (e) {
-        lastError = e;
-        if (!isGeminiModelFallbackError(e)) {
-          throw e;
+    const list = [...TEXT_MODEL_CANDIDATES];
+    outer: for (let i = 0; i < list.length; i += 1) {
+      const model = list[i]!;
+      for (let attempt = 0; attempt < GEMINI_MODEL_ATTEMPTS; attempt += 1) {
+        try {
+          const result = await getGeminiClient().models.generateContent({
+            model,
+            contents,
+            config,
+          });
+          setActiveTextModel(model);
+          return result;
+        } catch (e) {
+          lastError = e;
+          if (!isGeminiModelFallbackError(e)) {
+            throw e;
+          }
+          if (attempt < GEMINI_MODEL_ATTEMPTS - 1) {
+            await sleepMs(900 + attempt * 700);
+          }
         }
-        if (i < list.length - 1) {
-          await sleepMs(450);
-        }
+      }
+      if (i < list.length - 1) {
+        await sleepMs(GEMINI_MODEL_SWITCH_GAP_MS);
       }
     }
     throw lastError || new Error('No available text model');
@@ -1824,36 +1889,41 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
       let response: any = null;
       let lastModelError: any = null;
-      const modelList = TEXT_MODEL_CANDIDATES;
-      for (let i = 0; i < modelList.length; i += 1) {
-        const model = modelList[i];
-        try {
-          const chat = getGeminiClient().chats.create({
-            model,
-            config: {
-              systemInstruction,
-              temperature: 0.88,
-              topP: 0.92,
-              topK: 40,
-            },
-            history: history.length > 0 ? history : undefined,
-          });
-          response = await Promise.race([
-            chat.sendMessage({ message: contents }),
-            new Promise<never>((_, reject) => {
-              window.setTimeout(() => reject(new Error('CLIENT_TIMEOUT')), CHAT_SEND_TIMEOUT_MS);
-            }),
-          ]);
-          setActiveTextModel(model);
-          break;
-        } catch (e) {
-          lastModelError = e;
-          if (!isGeminiModelFallbackError(e)) {
-            throw e;
+      const modelList = [...TEXT_MODEL_CANDIDATES];
+      outer: for (let i = 0; i < modelList.length; i += 1) {
+        const model = modelList[i]!;
+        for (let attempt = 0; attempt < GEMINI_MODEL_ATTEMPTS; attempt += 1) {
+          try {
+            const chat = getGeminiClient().chats.create({
+              model,
+              config: {
+                systemInstruction,
+                temperature: 0.88,
+                topP: 0.92,
+                topK: 40,
+              },
+              history: history.length > 0 ? history : undefined,
+            });
+            response = await Promise.race([
+              chat.sendMessage({ message: contents }),
+              new Promise<never>((_, reject) => {
+                window.setTimeout(() => reject(new Error('CLIENT_TIMEOUT')), CHAT_SEND_TIMEOUT_MS);
+              }),
+            ]);
+            setActiveTextModel(model);
+            break outer;
+          } catch (e) {
+            lastModelError = e;
+            if (!isGeminiModelFallbackError(e)) {
+              throw e;
+            }
+            if (attempt < GEMINI_MODEL_ATTEMPTS - 1) {
+              await sleepMs(900 + attempt * 700);
+            }
           }
-          if (i < modelList.length - 1) {
-            await sleepMs(450);
-          }
+        }
+        if (i < modelList.length - 1) {
+          await sleepMs(GEMINI_MODEL_SWITCH_GAP_MS);
         }
       }
       if (!response) {
@@ -2011,7 +2081,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       };
 
       rec.onerror = (ev: SpeechRecognitionErrorEvent) => {
-        console.warn('[Clone dictation]', ev.error);
+        /** no-speech / aborted 为常见无害事件，勿打成 warn 以免误以为整条语音链路故障 */
+        if (ev.error !== 'no-speech' && ev.error !== 'aborted') {
+          console.warn('[Clone dictation]', ev.error);
+        }
         cloneHoldOutcomeRef.current = null;
         cloneHoldPointerIdRef.current = null;
         setInputText(cloneHoldSnapshotRef.current.trim());

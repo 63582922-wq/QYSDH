@@ -8,6 +8,7 @@
     "dev:restart": "node scripts/kill-dev-ports.mjs && vite --port=5173 --host=0.0.0.0",
     "build": "vite build",
     "start": "node ./scripts/serve-render-dist.mjs",
+    "start:fresh": "node scripts/kill-dist-serve-ports.mjs && npm run build && npm start",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "clean": "rm -rf dist",
     "lint": "node ./node_modules/typescript/bin/tsc --noEmit"

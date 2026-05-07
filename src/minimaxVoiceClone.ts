@@ -277,8 +277,21 @@ export async function uploadMinimaxVoiceCloneSource(file: File, signal?: AbortSi
   return String(id);
 }
 
+/** voice_clone 文档要求 file_id 为 int64；纯数字字符串在 JSON 中应发 number，避免 invalid params */
+function normalizeVoiceCloneFileIdForJsonBody(id: string | number): string | number {
+  if (typeof id === 'number' && Number.isFinite(id) && Number.isInteger(id)) {
+    return id;
+  }
+  const s = String(id).trim();
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    if (Number.isSafeInteger(n)) return n;
+  }
+  return id;
+}
+
 export async function requestMinimaxVoiceClone(params: {
-  /** 上传接口返回的 file_id（数值或字符串原样传给 JSON） */
+  /** 上传接口返回的 file_id（在请求体会规范为 number，若超出安全整数则保持原样） */
   sourceFileId: string | number;
   voiceId: string;
   previewText?: string;
@@ -290,14 +303,17 @@ export async function requestMinimaxVoiceClone(params: {
   warnMinimaxTokenPlanKeyInDev(apiKey);
 
   const root = resolveMinimaxApiRoot();
+  /** 与 T2A 默认解耦：voice_clone 常用 speech-02-hd；勿沿用 speech-2.8-hd 以免接口报 invalid params */
   const model =
     params.model ||
-    runtimeMinimaxTrimmed('MINIMAX_TTS_MODEL') ||
-    (typeof process !== 'undefined' && process.env.MINIMAX_TTS_MODEL?.trim()) ||
-    'speech-2.8-hd';
+    runtimeMinimaxTrimmed('MINIMAX_VOICE_CLONE_MODEL') ||
+    (typeof process !== 'undefined' && process.env.MINIMAX_VOICE_CLONE_MODEL) ||
+    'speech-02-hd';
   const text =
     params.previewText ||
     '你好，这是用你的声音复刻的效果。Hello, this is a preview of your cloned voice.';
+
+  const file_id = normalizeVoiceCloneFileIdForJsonBody(params.sourceFileId);
 
   const res = await fetch(withMinimaxGroupQuery(`${root}/v1/voice_clone`), {
     method: 'POST',
@@ -306,7 +322,7 @@ export async function requestMinimaxVoiceClone(params: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      file_id: params.sourceFileId,
+      file_id,
       voice_id: params.voiceId,
       text,
       model,

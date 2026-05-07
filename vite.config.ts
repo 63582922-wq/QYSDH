@@ -126,6 +126,9 @@ export default defineConfig(({mode}) => {
       'process.env.MINIMAX_TTS_MODEL': JSON.stringify(
         normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_TTS_MODEL')),
       ),
+      'process.env.MINIMAX_VOICE_CLONE_MODEL': JSON.stringify(
+        normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_VOICE_CLONE_MODEL')),
+      ),
       'process.env.MINIMAX_TTS_SPEED': JSON.stringify(
         normalizeMinimaxEnvValue(pickMinimax(mf, env, 'MINIMAX_TTS_SPEED')),
       ),

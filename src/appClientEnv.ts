@@ -25,19 +25,31 @@ export function runtimeMinimaxTrimmed(key: string): string {
 }
 
 export function getGeminiApiKey(): string {
-  const r = runtimeEnvTrimmed('GEMINI_API_KEY');
-  if (r) return r;
-  return typeof process !== 'undefined' && process.env.GEMINI_API_KEY
-    ? String(process.env.GEMINI_API_KEY).trim()
-    : '';
+  /**
+   * 生产由 `serve-render-dist` 注入 `__RUNTIME_APP_ENV__` 时，**禁止**再回退到 Vite `define` 写死的
+   * `process.env.GEMINI_API_KEY`（那是 `npm run build` 当刻的旧值），否则本机改 `.env.local` 仍像「没换新密钥」。
+   * 值经 `normalizeMinimaxEnvValue`：去掉 `.env` 里成对引号与首尾空白，避免 Google 报 API_KEY_INVALID。
+   */
+  if (typeof window !== 'undefined' && window.__RUNTIME_APP_ENV__ != null) {
+    const v = window.__RUNTIME_APP_ENV__['GEMINI_API_KEY'];
+    return normalizeMinimaxEnvValue(v != null ? String(v) : undefined);
+  }
+  return normalizeMinimaxEnvValue(
+    typeof process !== 'undefined' && process.env.GEMINI_API_KEY != null
+      ? String(process.env.GEMINI_API_KEY)
+      : undefined,
+  );
 }
 
 export function getGeminiLiveSpeechVoiceNameFromRuntimeOrDefine(): string {
-  const r = runtimeEnvTrimmed('GEMINI_LIVE_SPEECH_VOICE_NAME');
-  if (r) return r;
-  if (typeof process !== 'undefined' && process.env.GEMINI_LIVE_SPEECH_VOICE_NAME != null) {
-    const t = String(process.env.GEMINI_LIVE_SPEECH_VOICE_NAME).trim();
-    if (t.length > 0) return t;
+  if (typeof window !== 'undefined' && window.__RUNTIME_APP_ENV__ != null) {
+    const v = window.__RUNTIME_APP_ENV__['GEMINI_LIVE_SPEECH_VOICE_NAME'];
+    return normalizeMinimaxEnvValue(v != null ? String(v) : undefined);
   }
-  return '';
+  const t = normalizeMinimaxEnvValue(
+    typeof process !== 'undefined' && process.env.GEMINI_LIVE_SPEECH_VOICE_NAME != null
+      ? String(process.env.GEMINI_LIVE_SPEECH_VOICE_NAME)
+      : undefined,
+  );
+  return t.length > 0 ? t : '';
 }
