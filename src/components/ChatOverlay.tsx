@@ -327,7 +327,7 @@ const MAX_REPLY_CHARS = 8000;
 const MAX_TTS_CHARS = 4000;
 /** 复刻自动朗读结束后，字幕对话框再停留时长（约 1～2 秒） */
 const CLONE_TTS_POST_SPEECH_HOLD_MS = 1600;
-/** 复刻按住说话松手发送后，「我说」卡片再停留约两秒再收起（仅保留此框内文字，不再在上方重复气泡） */
+/** 复刻语音输入完成发送后，「我说」卡片再停留约两秒再收起（仅保留此框内文字，不再在上方重复气泡） */
 const CLONE_USER_POST_DICTATION_HOLD_MS = 2000;
 
 /** Live 回复 PCM 播放略放慢，减轻「赶」的感觉（略降音高，一般可接受） */
@@ -805,7 +805,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   /** Live：首段 PCM 排程在未来时刻时，推迟 setIsSpeaking(true)，避免声纹早于扬声器出声 */
   const liveAiSpeakingDelayTimerRef = useRef<number | null>(null);
 
-  /** 复刻链路：浏览器 SpeechRecognition → 按住说话，松手自动发送（同微信逻辑；不走 Live） */
+  /** 复刻链路：浏览器 SpeechRecognition → 点按开始录音，再点完成发送（不走 Live） */
   const [isCloneDictating, setIsCloneDictating] = useState(false);
   const cloneDictationRecognitionRef = useRef<SpeechRecognition | null>(null);
   const cloneDictationAccumRef = useRef('');
@@ -813,13 +813,14 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneHoldSnapshotRef = useRef('');
   const cloneHoldOutcomeRef = useRef<'send' | 'cancel' | null>(null);
   const cloneHoldCleanupStopRef = useRef(false);
-  const cloneHoldPointerIdRef = useRef<number | null>(null);
-  /** 按住说话：字幕与声纹同步，不写输入框 */
+  /** 已开始识别、等待用户第二次点按「完成」；用于 WebKit 过早 onend 时重开识别 */
+  const cloneAwaitingStopTapRef = useRef(false);
+  /** 点按说话：字幕与声纹同步，不写输入框 */
   const [cloneLiveCaptionUserLine, setCloneLiveCaptionUserLine] = useState('');
   const [cloneUserPostDictationHold, setCloneUserPostDictationHold] = useState(false);
-  /** 松手后短暂沿用本条听写正文，避免会话 state 未跟上时空白 */
+  /** 完成听写发送后短暂沿用本条正文，避免会话 state 未跟上时空白 */
   const [cloneUserPostDictationEcho, setCloneUserPostDictationEcho] = useState('');
-  /** 语音松手发送本轮：同步压制上方 pending 气泡（避免与「我说」重复），至本轮 AI 结束；与 state 并行以免批处理晚一拍 */
+  /** 语音输入发送本轮：同步压制上方 pending 气泡（避免与「我说」重复），至本轮 AI 结束；与 state 并行以免批处理晚一拍 */
   const cloneVoiceRoundSuppressPendingBubbleRef = useRef(false);
   const [cloneUserMicPrimed, setCloneUserMicPrimed] = useState(0);
   const cloneUserDictationHoldTimerRef = useRef<number | null>(null);
@@ -829,7 +830,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const sendMessageRef = useRef<(opts?: { textOverride?: string; preserveInputFromVoiceHold?: boolean }) => void>(
     () => {},
   );
-  /** 复刻底栏输入框：按住说时失焦，避免系统将听写写入 textarea 造成「又说了一次」 */
+  /** 复刻底栏输入框：听写进行中失焦，避免系统将听写写入 textarea 造成「又说了一次」 */
   const cloneBottomTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   /** 复刻 AI 字幕：随 reveal 增高时钉在底部，避免长文顶出可视区 */
   const cloneAiCaptionScrollRef = useRef<HTMLDivElement | null>(null);
@@ -1048,7 +1049,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneAiCaptionAlt = cloneCaptionState?.aiAlt ?? '';
   const cloneWaitingForModel = cloneCaptionState?.waitingForModel ?? false;
   const cloneAwaitingTtsStart = cloneCaptionState?.awaitingTtsStart ?? false;
-  /** 复刻：仅在按住说 / 松手后短时回声显示文案，不用会话里上一轮 userMain（避免第二轮仍显示上一句） */
+  /** 复刻：仅在听写中 / 发送后短时回声显示文案，不用会话里上一轮 userMain（避免第二轮仍显示上一句） */
   const cloneUserSubtitleDisplay = isCloneDictating
     ? cloneLiveCaptionUserLine.trim()
     : cloneUserPostDictationHold && cloneUserPostDictationEcho.trim()
@@ -1064,7 +1065,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       cloneUserPostDictationHold);
 
   /**
-   * 自动朗读时：字幕对话框仅在「本轮进行中」展示（等待 / 播报 / 按住说），避免一整轮结束后仍占屏；
+   * 自动朗读时：字幕对话框仅在「本轮进行中」展示（等待 / 播报 / 语音输入），避免一整轮结束后仍占屏；
    * 关自动朗读时：保留卡片便于阅读未播音的完整回复。
    */
   const cloneSubtitlePanelsActive =
@@ -2236,7 +2237,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
           console.warn('[Clone dictation]', ev.error);
         }
         cloneHoldOutcomeRef.current = null;
-        cloneHoldPointerIdRef.current = null;
+        cloneAwaitingStopTapRef.current = false;
         setInputText(cloneHoldSnapshotRef.current.trim());
         setCloneLiveCaptionUserLine('');
         cloneDictationAccumRef.current = '';
@@ -2264,21 +2265,22 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
           setIsCloneDictating(false);
           cloneHoldCleanupStopRef.current = false;
           cloneHoldOutcomeRef.current = null;
-          cloneHoldPointerIdRef.current = null;
+          cloneAwaitingStopTapRef.current = false;
           return;
         }
 
-        const stillHolding = cloneHoldPointerIdRef.current !== null;
+        const awaitingStopTap = cloneAwaitingStopTapRef.current;
         const outcome = cloneHoldOutcomeRef.current;
 
-        /** iOS / 部分 WebKit 会过早结束 continuous 会话：手指仍按住且无松手结论时换实例重开 */
-        if (stillHolding && outcome == null && restartDepth < 22) {
+        /** iOS / 部分 WebKit 会过早结束 continuous 会话：仍在录音阶段且无「完成」结论时换实例重开 */
+        if (awaitingStopTap && outcome == null && restartDepth < 22) {
           try {
             const next = new SR();
             bindCloneDictationHandlers(next, restartDepth + 1);
             cloneDictationRecognitionRef.current = next;
             next.start();
             setIsCloneDictating(true);
+            cloneAwaitingStopTapRef.current = true;
             return;
           } catch (e2) {
             console.warn('[Clone dictation] re-arm failed', e2);
@@ -2290,9 +2292,12 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
         const oc = outcome;
         cloneHoldOutcomeRef.current = null;
-        cloneHoldPointerIdRef.current = null;
+        cloneAwaitingStopTapRef.current = false;
 
         if (oc == null) {
+          setCloneLiveCaptionUserLine('');
+          cloneDictationAccumRef.current = '';
+          cloneDictationInterimRef.current = '';
           return;
         }
 
@@ -2328,10 +2333,12 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       cloneDictationRecognitionRef.current = rec0;
       rec0.start();
       setIsCloneDictating(true);
+      cloneAwaitingStopTapRef.current = true;
       return true;
     } catch (e) {
       console.warn('SpeechRecognition.start failed', e);
       cloneDictationRecognitionRef.current = null;
+      cloneAwaitingStopTapRef.current = false;
       stopCloneUserMicCapture();
       setVoiceBlockingMessage(
         language === 'zh' ? '无法启动语音识别，请稍后重试。' : 'Could not start speech recognition.',
@@ -3057,55 +3064,27 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         }
       }
       setIsCloneDictating(false);
+      cloneAwaitingStopTapRef.current = false;
       stopCloneUserMicCapture();
     },
     [stopCloneUserMicCapture],
   );
 
-  const finishCloneMicHold = (e: React.PointerEvent<HTMLButtonElement>, forcedCancel?: boolean) => {
-    if (e.pointerId !== cloneHoldPointerIdRef.current) return;
-    cloneHoldPointerIdRef.current = null;
-    try {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
+  /** 复刻：点一下开始听写，再点一下结束并发送 */
+  const onCloneMicTap = () => {
+    if (conversationMode !== 'text_clone' || isTyping) return;
 
-    if (!cloneDictationRecognitionRef.current) {
-      stopCloneUserMicCapture();
+    if (isCloneDictating) {
+      if (!cloneDictationRecognitionRef.current) {
+        stopCloneDictation();
+        return;
+      }
+      cloneHoldOutcomeRef.current = 'send';
+      stopCloneDictation();
       return;
     }
 
-    if (forcedCancel) {
-      cloneHoldOutcomeRef.current = 'cancel';
-    } else {
-      const rect = e.currentTarget.getBoundingClientRect();
-      const inside =
-        e.clientX >= rect.left &&
-        e.clientX <= rect.right &&
-        e.clientY >= rect.top &&
-        e.clientY <= rect.bottom;
-      cloneHoldOutcomeRef.current = inside ? 'send' : 'cancel';
-    }
-
-    stopCloneDictation();
-  };
-
-  const onCloneMicPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (conversationMode !== 'text_clone' || isTyping) return;
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (cloneHoldPointerIdRef.current != null) return;
-
     clearCloneUserDictationHold();
-
-    cloneHoldPointerIdRef.current = e.pointerId;
-    e.preventDefault();
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
-
     cloneHoldSnapshotRef.current = inputTextRef.current;
     cloneDictationAccumRef.current = '';
     cloneDictationInterimRef.current = '';
@@ -3118,15 +3097,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       /* ignore */
     }
 
-    const ok = beginCloneHoldSpeechRecognition();
-    if (!ok) {
-      cloneHoldPointerIdRef.current = null;
-      try {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      } catch {
-        /* ignore */
-      }
-    }
+    void beginCloneHoldSpeechRecognition();
   };
 
   useEffect(() => {
@@ -3157,7 +3128,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     return () => window.clearInterval(id);
   }, [isVoiceMode, isVoiceConnecting]);
 
-  /** Live「我说」面板 / 复刻按住说：声纹与字幕同源节奏（复刻用独立麦克风流 + Analyser） */
+  /** Live「我说」面板 / 复刻点按麦克风：声纹与字幕同源节奏（复刻用独立麦克风流 + Analyser） */
   useEffect(() => {
     const liveUserPanelVisible =
       allowLiveVoice &&
@@ -3822,7 +3793,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                           </p>
                         ) : isCloneDictating ? (
                           <p className="text-[10px] text-zinc-600 not-italic md:text-[11px]">
-                            {language === 'zh' ? '正在聆听…' : 'Listening…'}
+                            {language === 'zh' ? '再点一下麦克风完成并发送' : 'Tap the mic again to finish and send'}
                           </p>
                         ) : null}
                         {cloneUserCaptionAlt ? (
@@ -3906,23 +3877,13 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             <div className="relative flex w-full flex-col items-center gap-2 md:gap-2.5">
               <button
                 type="button"
-                onPointerDown={onCloneMicPointerDown}
-                onPointerUp={(e) => finishCloneMicHold(e)}
-                onPointerCancel={(e) => finishCloneMicHold(e, true)}
-                onLostPointerCapture={(e) => {
-                  if (cloneHoldPointerIdRef.current !== e.pointerId) return;
-                  cloneHoldPointerIdRef.current = null;
-                  if (cloneDictationRecognitionRef.current) {
-                    cloneHoldOutcomeRef.current = 'cancel';
-                    stopCloneDictation();
-                  } else {
-                    stopCloneUserMicCapture();
-                  }
-                }}
+                onClick={onCloneMicTap}
                 disabled={isTyping}
-                title={language === 'zh' ? '按住说 · 松手发' : 'Hold · release to send'}
+                title={language === 'zh' ? '点按开始录音，再点完成发送' : 'Tap to start, tap again to send'}
                 aria-pressed={isCloneDictating}
-                aria-label={language === 'zh' ? '按住说话，松开发送' : 'Hold to talk, release to send'}
+                aria-label={
+                  language === 'zh' ? '点按开始语音输入，再点一次完成并发送' : 'Tap to start voice input, tap again to send'
+                }
                 className={`select-none flex h-12 min-h-[48px] w-12 min-w-[48px] shrink-0 touch-manipulation items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/60 text-zinc-400 shadow-lg backdrop-blur-md transition-colors hover:bg-zinc-800/80 hover:text-zinc-200 active:bg-zinc-800/80 md:h-14 md:min-h-[56px] md:w-14 md:min-w-[56px] ${
                   isCloneDictating
                     ? 'border-emerald-500/45 text-emerald-400 shadow-[0_0_16px_rgba(52,211,153,0.12)] hover:bg-zinc-900/60'
