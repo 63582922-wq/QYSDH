@@ -110,8 +110,41 @@ const LIVE_MIC_RMS_THRESHOLD = 0.013;
 const LIVE_VOICE_TAIL_MS = 420;
 /** Live 上行音频：与旧 ScriptProcessor 一致按固长度打包再 send，避免 Worklet 128 帧一包刷爆 WebSocket 导致 1006 */
 const LIVE_MIC_WEBSOCKET_SAMPLES = 4096;
+/** Gemini Live 声明的 PCM 采样率；须与 `sendRealtimeInput` 的 mimeType 及 payload 一致 */
+const LIVE_GEMINI_INPUT_RATE = 16000;
 /** 1006/1011 无干净关闭帧时自动重连次数上限（单次点麦克风会话内） */
 const LIVE_WS_ABNORMAL_MAX_AUTO_RETRIES = 2;
+
+/**
+ * 线性重采样到固定输出长度（mic 块）：用于 iOS/WebKit 实际 44.1k/48k 而 API 要求 16k 的场景。
+ */
+function resampleFloat32ToOutLength(input: Float32Array, outLen: number): Float32Array {
+  if (outLen <= 0) return new Float32Array(0);
+  if (input.length === 0) return new Float32Array(outLen);
+  if (input.length === 1) {
+    const v = input[0]!;
+    const out = new Float32Array(outLen);
+    out.fill(v);
+    return out;
+  }
+  const out = new Float32Array(outLen);
+  const imax = input.length - 1;
+  for (let i = 0; i < outLen; i++) {
+    const t = outLen === 1 ? 0 : (i / (outLen - 1)) * imax;
+    const i0 = Math.min(imax - 1, Math.floor(t));
+    const frac = t - i0;
+    const a = input[i0]!;
+    const b = input[i0 + 1]!;
+    out[i] = a * (1 - frac) + b * frac;
+  }
+  return out;
+}
+
+/** 得到 outSamples 个 16k 样本时，在 fromRate 下至少需要的源样本数 */
+function liveSourceSamplesFor16kBlock(fromRate: number, outSamples: number): number {
+  if (!Number.isFinite(fromRate) || fromRate <= 0) return Math.max(2, outSamples);
+  return Math.max(2, Math.round((outSamples * fromRate) / LIVE_GEMINI_INPUT_RATE));
+}
 
 /** 「我说」声纹：多层平滑正弦 + lighter 叠亮 + 中心包络（对齐参考图丝带光感） */
 const VOICEPRINT_CANVAS_W = 320;
@@ -868,6 +901,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const voiceLiveReadyRef = useRef(false);
   /** AudioWorklet 小帧拼包剩余样本；stop 时清空 */
   const liveMicPcmRemainderRef = useRef<Float32Array | null>(null);
+  /** Live 麦克风图实际采样率（与 LIVE_GEMINI_INPUT_RATE 不一致时需重采样上行 PCM） */
+  const liveMicActualSampleRateRef = useRef(LIVE_GEMINI_INPUT_RATE);
   /** 用户主动关了麦克风时为 true；异常断线时为 false 才可能自动重连 */
   const liveVoiceUserStoppedRef = useRef(true);
   /** 单次开麦周期内 1006/1011 自动重连已尝试次数；成功连上后归零 */
@@ -988,7 +1023,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           return;
         }
         cloneUserMicStreamRef.current = stream;
-        const ctx = new AudioContext();
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        const ctx = new Ctx();
         cloneUserMicCtxRef.current = ctx;
         const src = ctx.createMediaStreamSource(stream);
         const analyser = ctx.createAnalyser();
@@ -2518,6 +2554,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     liveVoiceSessionGenRef.current += 1;
     voiceLiveReadyRef.current = false;
     liveMicPcmRemainderRef.current = null;
+    liveMicActualSampleRateRef.current = LIVE_GEMINI_INPUT_RATE;
     /** 尽快摘掉麦克风 Worklet/ScriptProcessor，避免 WS 已断时下一帧仍调用 sendRealtimeInput */
     if (processorMuteRef.current) {
       try {
@@ -2697,7 +2734,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
      }
 
      try {
-         const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+         const ACtor = window.AudioContext || (window as any).webkitAudioContext;
+         let audioContext: AudioContext;
+         try {
+           audioContext = new ACtor({ sampleRate: LIVE_GEMINI_INPUT_RATE });
+         } catch {
+           audioContext = new ACtor();
+         }
+         liveMicActualSampleRateRef.current = audioContext.sampleRate;
          audioContextRef.current = audioContext;
          await audioContext.resume();
 
@@ -2738,9 +2782,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
          let stream: MediaStream;
          try {
-           stream = await navigator.mediaDevices.getUserMedia({
-             audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-           });
+           try {
+             stream = await navigator.mediaDevices.getUserMedia({
+               audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+             });
+           } catch {
+             /** iOS / 部分 WebView 对 channelCount 等约束较挑剔，降级为默认 audio */
+             stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+           }
          } catch (micErr: unknown) {
            window.clearTimeout(timeoutId);
            console.error(micErr);
@@ -2801,7 +2850,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             if (!voiceLiveReadyRef.current || liveSessionRef.current !== sess) return;
             if (!liveSessionSocketIsOpen(sess)) return;
             sess.sendRealtimeInput({
-              audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
+              audio: { data: base64Data, mimeType: `audio/pcm;rate=${LIVE_GEMINI_INPUT_RATE}` },
             });
           } catch {
             /* WebSocket 已关闭时仍可能收到最后一帧，忽略即可 */
@@ -2825,27 +2874,46 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             combined = incoming;
           }
 
-          let offset = 0;
+          const fromRate = liveMicActualSampleRateRef.current;
           const n = LIVE_MIC_WEBSOCKET_SAMPLES;
-          while (offset + n <= combined.length) {
-            /** 未就绪时 flushLiveMicChunk 会直接 return；若仍 offset+=n 会把人声整块扔掉（连接中/刚重连常见 → 「无回复」） */
-            if (
-              !voiceLiveReadyRef.current ||
-              !liveSessionRef.current ||
-              !liveSessionSocketIsOpen(liveSessionRef.current)
-            ) {
-              break;
+          const canSend = () =>
+            Boolean(
+              voiceLiveReadyRef.current &&
+                liveSessionRef.current &&
+                liveSessionSocketIsOpen(liveSessionRef.current),
+            );
+
+          if (Math.abs(fromRate - LIVE_GEMINI_INPUT_RATE) < 0.5) {
+            let offset = 0;
+            while (offset + n <= combined.length) {
+              if (!canSend()) break;
+              const block = new Float32Array(n);
+              block.set(combined.subarray(offset, offset + n));
+              flushLiveMicChunk(block);
+              offset += n;
             }
-            const block = new Float32Array(n);
-            block.set(combined.subarray(offset, offset + n));
-            flushLiveMicChunk(block);
-            offset += n;
-          }
-          if (offset < combined.length) {
-            const tail = combined.subarray(offset);
-            const hold = new Float32Array(tail.length);
-            hold.set(tail);
-            liveMicPcmRemainderRef.current = hold;
+            if (offset < combined.length) {
+              const tail = combined.subarray(offset);
+              const hold = new Float32Array(tail.length);
+              hold.set(tail);
+              liveMicPcmRemainderRef.current = hold;
+            }
+          } else {
+            const needIn = liveSourceSamplesFor16kBlock(fromRate, n);
+            let offset = 0;
+            while (offset + needIn <= combined.length) {
+              if (!canSend()) break;
+              const slice = combined.subarray(offset, offset + needIn);
+              const block = resampleFloat32ToOutLength(slice, n);
+              flushLiveMicChunk(block);
+              offset += needIn;
+            }
+            if (offset < combined.length) {
+              const tail = combined.subarray(offset);
+              const hold = new Float32Array(tail.length);
+              hold.set(tail);
+              liveMicPcmRemainderRef.current = hold;
+            }
           }
         };
 
