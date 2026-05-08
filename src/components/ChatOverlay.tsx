@@ -1821,16 +1821,32 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             const audio = new Audio(objectUrl);
             minimaxAudioRef.current = audio;
 
-            const ACtor = window.AudioContext || (window as any).webkitAudioContext;
-            if (!ACtor) throw new Error('AudioContext not supported');
-            const ctx = new ACtor();
-            minimaxAudioCtxRef.current = ctx;
-            const src = ctx.createMediaElementSource(audio);
-            const analyser = ctx.createAnalyser();
-            analyser.fftSize = 256;
-            src.connect(analyser);
-            analyser.connect(ctx.destination);
-            liveAiVoiceAnalyserRef.current = analyser;
+            /**
+             * 安卓浏览器：AudioContext 若在非用户手势（useEffect）中创建则处于 suspended 状态，
+             * createMediaElementSource 会劫持音频输出 → 声音被吞。
+             * 先尝试 resume，成功才走 AudioContext 声纹；失败则直接播放，声纹用合成波形。
+             */
+            let analyser: AnalyserNode | null = null;
+            let ctx: AudioContext | null = null;
+            try {
+              const ACtor = window.AudioContext || (window as any).webkitAudioContext;
+              if (ACtor) {
+                const tryCtx = new ACtor();
+                void tryCtx.resume();
+                if (tryCtx.state === 'running') {
+                  const src = tryCtx.createMediaElementSource(audio);
+                  analyser = tryCtx.createAnalyser();
+                  analyser.fftSize = 256;
+                  src.connect(analyser);
+                  analyser.connect(tryCtx.destination);
+                  ctx = tryCtx;
+                  minimaxAudioCtxRef.current = ctx;
+                  liveAiVoiceAnalyserRef.current = analyser;
+                } else {
+                  tryCtx.close().catch(() => {});
+                }
+              }
+            } catch { /* AudioContext 不可用，直接播放 */ }
 
             const teardownMinimaxAudioSurface = () => {
               stopMinimaxPlaybackVisual();
@@ -1848,10 +1864,10 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             };
 
             audio.onplay = () => {
-              void ctx.resume();
+              if (ctx) void ctx.resume();
               minimaxRevealPlaybackStartedRef.current = true;
               setCloneTtsRevealLen((n) => Math.max(n, 1));
-              startMinimaxAnalyserLoop(audio, analyser);
+              if (analyser) startMinimaxAnalyserLoop(audio, analyser);
             };
             audio.onended = () => {
               teardownMinimaxAudioSurface();
