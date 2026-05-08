@@ -517,16 +517,6 @@ async function geminiTextModelFallbackLoop<T>(params: {
 }
 
 /** Short user-facing text; avoids dumping huge JSON (e.g. quota / 429). */
-/** 避免 localStorage 损坏或异步完成后解析抛错导致整页白屏 */
-function parseStoredSessions(raw: string | null): ChatSession[] {
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
 
 /** 复刻对话随轮次附图：仅支持 data URL → Gemini inlineData */
 function parseDataUrlForGeminiInline(dataUrl: string): { mimeType: string; data: string } | null {
@@ -545,6 +535,73 @@ function safeMsgText(t: unknown): string {
   if (typeof t === 'string') return t;
   if (typeof t === 'number' || typeof t === 'boolean') return String(t);
   return '';
+}
+
+/** 历史会话 theme 若存成对象/数组，直接 JSX 渲染会抛错（移动端 WebView 常见） */
+function safeSessionTheme(t: unknown): string {
+  return safeMsgText(t).trim().slice(0, 240);
+}
+
+function normalizeStoredChatMessage(m: unknown): ChatMessage | null {
+  if (!m || typeof m !== 'object') return null;
+  const o = m as Record<string, unknown>;
+  if (o.role !== 'user' && o.role !== 'model') return null;
+  const msg: ChatMessage = {
+    role: o.role,
+    text: typeof o.text === 'string' ? o.text : safeMsgText(o.text),
+  };
+  if (o.kind === 'closing_note') msg.kind = 'closing_note';
+  if (typeof o.isInitialImage === 'boolean') msg.isInitialImage = o.isInitialImage;
+  if (typeof o.attachedImageDataUrl === 'string') msg.attachedImageDataUrl = o.attachedImageDataUrl;
+  return msg;
+}
+
+function normalizeStoredChatSession(item: unknown): ChatSession | null {
+  if (!item || typeof item !== 'object') return null;
+  const o = item as Record<string, unknown>;
+  const id =
+    typeof o.id === 'string'
+      ? o.id
+      : typeof o.id === 'number' && Number.isFinite(o.id)
+        ? String(o.id)
+        : '';
+  if (!id) return null;
+  const themeSt = safeSessionTheme(o.theme);
+  const theme = themeSt.length > 0 ? themeSt : '…';
+  const messages: ChatMessage[] = [];
+  if (Array.isArray(o.messages)) {
+    for (const row of o.messages) {
+      const msg = normalizeStoredChatMessage(row);
+      if (msg) messages.push(msg);
+    }
+  }
+  const updatedAt =
+    typeof o.updatedAt === 'number' && Number.isFinite(o.updatedAt) ? o.updatedAt : Date.now();
+  const s: ChatSession = { id, theme, messages, updatedAt };
+  if (typeof o.thumbnailDataUrl === 'string') s.thumbnailDataUrl = o.thumbnailDataUrl;
+  if (o.etchedToAlbum === true) {
+    s.etchedToAlbum = true;
+    s.etchedAt =
+      typeof o.etchedAt === 'number' && Number.isFinite(o.etchedAt) ? o.etchedAt : Date.now();
+  }
+  return s;
+}
+
+/** 避免 localStorage 损坏或非法类型导致整页白屏 */
+function parseStoredSessions(raw: string | null): ChatSession[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: ChatSession[] = [];
+    for (const row of parsed) {
+      const s = normalizeStoredChatSession(row);
+      if (s) out.push(s);
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 /** 触摸机 SpeechRecognition：第二次点「完成」后稍晚再 stop，降低 onend 早于最后一条 final 的概率 */
@@ -1027,6 +1084,10 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneDictationStopTimerRef = useRef<number | null>(null);
   /** onend 时若首读全文为空，延迟再读 accum（勿与过早清空 ref 竞态） */
   const cloneDictationLateSendTimerRef = useRef<number | null>(null);
+  /** 部分机型 onend 丢失：在「完成」点按后再兜底读 ref 发送一次 */
+  const cloneDictationVoiceFallbackTimerRef = useRef<number | null>(null);
+  /** 复刻语音本轮是否已成功触发 sendMessage，避免 onend + 兜底双发 */
+  const cloneVoiceSendCommittedRef = useRef(false);
   /** 点按说话：字幕与声纹同步，不写输入框 */
   const [cloneLiveCaptionUserLine, setCloneLiveCaptionUserLine] = useState('');
   const [cloneUserPostDictationHold, setCloneUserPostDictationHold] = useState(false);
@@ -2412,6 +2473,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       window.clearTimeout(cloneDictationLateSendTimerRef.current);
       cloneDictationLateSendTimerRef.current = null;
     }
+    if (cloneDictationVoiceFallbackTimerRef.current != null) {
+      window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+      cloneDictationVoiceFallbackTimerRef.current = null;
+    }
     if (cloneDictationStopTimerRef.current != null) {
       window.clearTimeout(cloneDictationStopTimerRef.current);
       cloneDictationStopTimerRef.current = null;
@@ -2420,6 +2485,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       cancelAnimationFrame(cloneCaptionFlushRafRef.current);
       cloneCaptionFlushRafRef.current = null;
     }
+    cloneVoiceSendCommittedRef.current = false;
     type SRCtor = new () => SpeechRecognition;
     const w = window as Window & { SpeechRecognition?: SRCtor; webkitSpeechRecognition?: SRCtor };
     const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
@@ -2464,6 +2530,24 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         if (ev.error !== 'no-speech' && ev.error !== 'aborted') {
           console.warn('[Clone dictation]', ev.error);
         }
+        /** 用户点「完成」后 stop()：Chrome/Android 常先发 aborted，若清空 outcome，onend 会丢失发送意图 */
+        const benignAbort =
+          (ev.error === 'aborted' || ev.error === 'no-speech') && cloneHoldOutcomeRef.current === 'send';
+        if (benignAbort) {
+          if (cloneDictationStopTimerRef.current != null) {
+            window.clearTimeout(cloneDictationStopTimerRef.current);
+            cloneDictationStopTimerRef.current = null;
+          }
+          if (cloneDictationLateSendTimerRef.current != null) {
+            window.clearTimeout(cloneDictationLateSendTimerRef.current);
+            cloneDictationLateSendTimerRef.current = null;
+          }
+          if (cloneCaptionFlushRafRef.current != null) {
+            cancelAnimationFrame(cloneCaptionFlushRafRef.current);
+            cloneCaptionFlushRafRef.current = null;
+          }
+          return;
+        }
         if (cloneDictationStopTimerRef.current != null) {
           window.clearTimeout(cloneDictationStopTimerRef.current);
           cloneDictationStopTimerRef.current = null;
@@ -2471,6 +2555,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         if (cloneDictationLateSendTimerRef.current != null) {
           window.clearTimeout(cloneDictationLateSendTimerRef.current);
           cloneDictationLateSendTimerRef.current = null;
+        }
+        if (cloneDictationVoiceFallbackTimerRef.current != null) {
+          window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+          cloneDictationVoiceFallbackTimerRef.current = null;
         }
         cloneHoldOutcomeRef.current = null;
         cloneAwaitingStopTapRef.current = false;
@@ -2482,6 +2570,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         setCloneLiveCaptionUserLine('');
         cloneDictationAccumRef.current = '';
         cloneDictationInterimRef.current = '';
+        cloneVoiceSendCommittedRef.current = false;
         stopCloneUserMicCapture();
         if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
           setVoiceBlockingMessage(
@@ -2543,17 +2632,27 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         }
 
         if (oc == null) {
+          if (cloneDictationVoiceFallbackTimerRef.current != null) {
+            window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+            cloneDictationVoiceFallbackTimerRef.current = null;
+          }
           setCloneLiveCaptionUserLine('');
           cloneDictationAccumRef.current = '';
           cloneDictationInterimRef.current = '';
+          cloneVoiceSendCommittedRef.current = false;
           return;
         }
 
         if (oc === 'cancel') {
+          if (cloneDictationVoiceFallbackTimerRef.current != null) {
+            window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+            cloneDictationVoiceFallbackTimerRef.current = null;
+          }
           setInputText(cloneHoldSnapshotRef.current.trim());
           setCloneLiveCaptionUserLine('');
           cloneDictationAccumRef.current = '';
           cloneDictationInterimRef.current = '';
+          cloneVoiceSendCommittedRef.current = false;
           return;
         }
 
@@ -2575,6 +2674,11 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
               cloneDictationAccumRef.current = '';
               cloneDictationInterimRef.current = '';
               if (full2) {
+                if (cloneDictationVoiceFallbackTimerRef.current != null) {
+                  window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+                  cloneDictationVoiceFallbackTimerRef.current = null;
+                }
+                cloneVoiceSendCommittedRef.current = true;
                 setInputText(cloneHoldSnapshotRef.current.trim());
                 armCloneUserDictationHoldAfterSend(full2);
                 setCloneLiveCaptionUserLine('');
@@ -2586,12 +2690,22 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             }, getCloneDictationLateTextCatchupMs());
             return;
           }
+          if (cloneDictationVoiceFallbackTimerRef.current != null) {
+            window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+            cloneDictationVoiceFallbackTimerRef.current = null;
+          }
           cloneDictationAccumRef.current = '';
           cloneDictationInterimRef.current = '';
           setInputText(cloneHoldSnapshotRef.current.trim());
           setCloneLiveCaptionUserLine('');
+          cloneVoiceSendCommittedRef.current = false;
           return;
         }
+        if (cloneDictationVoiceFallbackTimerRef.current != null) {
+          window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+          cloneDictationVoiceFallbackTimerRef.current = null;
+        }
+        cloneVoiceSendCommittedRef.current = true;
         cloneDictationAccumRef.current = '';
         cloneDictationInterimRef.current = '';
         setInputText(cloneHoldSnapshotRef.current.trim());
@@ -3365,6 +3479,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const stopCloneDictation = useCallback(
     (opts?: { cleanup?: boolean }) => {
+      if (cloneDictationVoiceFallbackTimerRef.current != null) {
+        window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+        cloneDictationVoiceFallbackTimerRef.current = null;
+      }
       if (cloneDictationLateSendTimerRef.current != null) {
         window.clearTimeout(cloneDictationLateSendTimerRef.current);
         cloneDictationLateSendTimerRef.current = null;
@@ -3410,6 +3528,31 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       }
       flushCloneCaptionFromRefs();
       cloneHoldOutcomeRef.current = 'send';
+      cloneVoiceSendCommittedRef.current = false;
+      if (cloneDictationVoiceFallbackTimerRef.current != null) {
+        window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+        cloneDictationVoiceFallbackTimerRef.current = null;
+      }
+      cloneDictationVoiceFallbackTimerRef.current = window.setTimeout(() => {
+        cloneDictationVoiceFallbackTimerRef.current = null;
+        if (cloneVoiceSendCommittedRef.current) return;
+        flushCloneCaptionFromRefs();
+        const midF = cloneDictationAccumRef.current.trim();
+        const tailF = cloneDictationInterimRef.current.trim();
+        const fullF = [midF, tailF].filter((x) => x.length > 0).join(' ').trim();
+        cloneDictationAccumRef.current = '';
+        cloneDictationInterimRef.current = '';
+        if (fullF) {
+          cloneVoiceSendCommittedRef.current = true;
+          setInputText(cloneHoldSnapshotRef.current.trim());
+          armCloneUserDictationHoldAfterSend(fullF);
+          setCloneLiveCaptionUserLine('');
+          sendMessageRef.current({ textOverride: fullF, preserveInputFromVoiceHold: true });
+        } else {
+          setInputText(cloneHoldSnapshotRef.current.trim());
+          setCloneLiveCaptionUserLine('');
+        }
+      }, 1500);
       cloneDictationStopTimerRef.current = window.setTimeout(() => {
         cloneDictationStopTimerRef.current = null;
         stopCloneDictation();
@@ -3753,6 +3896,14 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         window.clearTimeout(cloneDictationLateSendTimerRef.current);
         cloneDictationLateSendTimerRef.current = null;
       }
+      if (cloneDictationVoiceFallbackTimerRef.current != null) {
+        window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
+        cloneDictationVoiceFallbackTimerRef.current = null;
+      }
+      if (cloneDictationStopTimerRef.current != null) {
+        window.clearTimeout(cloneDictationStopTimerRef.current);
+        cloneDictationStopTimerRef.current = null;
+      }
       cloneHoldCleanupStopRef.current = true;
       try {
         cloneDictationRecognitionRef.current?.stop();
@@ -3769,7 +3920,9 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     conversationMode === 'text_clone' ||
     (allowLiveVoice && (isVoiceMode || isVoiceConnecting || liveVoiceHandoff));
 
-  const aiDisplayName = aiName.trim() || (language === 'zh' ? '潜意识回响' : 'ECHO OF MIND');
+  const aiDisplayName =
+    (typeof aiName === 'string' ? aiName : String(aiName ?? '')).trim() ||
+    (language === 'zh' ? '潜意识回响' : 'ECHO OF MIND');
 
   /** 仅流式/即时态：不用历史一轮回填，避免字幕框常驻 */
   const liveUserCaptionMain = liveStreamUser.trim();
@@ -3847,7 +4000,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
           <button
             key={s.id}
             type="button"
-            title={s.theme}
+            title={safeSessionTheme(s.theme)}
             onClick={() => {
               setActiveSessionId(s.id);
               setShowSavePreview(false);
@@ -3857,7 +4010,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                 ? 'border-rose-400/80 bg-rose-200/40 shadow-[0_0_14px_rgba(251,113,133,0.5)]'
                 : 'border-zinc-500/45 bg-zinc-200/20 shadow-[0_0_10px_rgba(228,228,231,0.22)] hover:border-zinc-400/70 hover:bg-zinc-100/35'
             } ${idx % 5 === 0 ? 'motion-safe:animate-pulse' : ''}`}
-            aria-label={s.theme}
+            aria-label={safeSessionTheme(s.theme)}
           />
         ))}
       </div>
@@ -4483,7 +4636,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                                   <div className="absolute inset-0 bg-gradient-to-t from-black via-black/55 to-black/10" />
                                   <div className="relative mt-auto flex flex-col gap-1.5 p-5 pt-16">
                                     <h3 className="line-clamp-3 font-serif text-[1.05rem] italic leading-snug tracking-wide text-zinc-100 md:text-lg">
-                                      {s.theme}
+                                      {safeSessionTheme(s.theme)}
                                     </h3>
                                     <p className="text-[10px] uppercase tracking-[0.28em] text-zinc-500">
                                       {new Date(s.updatedAt).toLocaleString()}
@@ -4566,7 +4719,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                   </div>
                </div>
                <h2 className="mt-2 font-serif text-[1.65rem] italic leading-snug tracking-[0.08em] text-zinc-100 md:text-3xl md:leading-tight md:tracking-[0.1em]">
-                 {activeSession.theme}
+                 {safeSessionTheme(activeSession.theme)}
                </h2>
             </div>
 
