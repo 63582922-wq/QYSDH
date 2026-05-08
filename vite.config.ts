@@ -179,5 +179,9 @@ export default defineConfig(({mode}) => {
       strictPort: false,
       allowedHosts: true,
     },
+    build: {
+      /** 主 chunk 约 620kB gzip 前；默认 500kB 会刷屏告警，略抬高以免 CI 噪声（仍建议后续 manualChunks 拆分） */
+      chunkSizeWarningLimit: 800,
+    },
   };
 });
