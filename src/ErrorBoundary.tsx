@@ -8,6 +8,8 @@ interface State {
   hasError: boolean;
 }
 
+const ERROR_LOG_KEY = 'subconscious_last_render_error';
+
 /** 防止单次渲染抛错导致整页黑屏 / 白屏（常见于移动端 WebView） */
 export class ErrorBoundary extends Component<Props, State> {
   declare readonly props: Readonly<Props>;
@@ -19,6 +21,14 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error('App render error:', error, info.componentStack);
+    try {
+      localStorage.setItem(ERROR_LOG_KEY, JSON.stringify({
+        message: error?.message ?? String(error),
+        stack: error?.stack?.slice(0, 2000) ?? '',
+        componentStack: info.componentStack?.slice(0, 2000) ?? '',
+        ts: Date.now(),
+      }));
+    } catch { /* ignore */ }
   }
 
   render() {

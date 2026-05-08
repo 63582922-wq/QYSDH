@@ -1682,7 +1682,16 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       }
       lastSpokenMessageIdRef.current = messageId;
       setIsSpeaking(true);
-      window.speechSynthesis.cancel();
+
+      /**
+       * speechSynthesis.cancel() 在部分安卓浏览器上会同步触发旧 utterance 的 onerror，
+       * 若该回调直接调用 scheduleCloneTtsDone() 修改 state，可能与当前渲染帧的
+       * setState 嵌套，导致 React 抛 "Cannot update during render" 被ErrorBoundary 捕获。
+       * 用 isCurrentEpoch 判断当前回合，旧回调检测到不匹配时跳过 state 更新。
+       */
+      const isCurrentEpoch = (): boolean => lastSpokenMessageIdRef.current === messageId;
+
+      try { window.speechSynthesis.cancel(); } catch { /* ignore */ }
       stopMinimaxPlayback();
 
       const speakSlice = text.length > MAX_TTS_CHARS ? `${text.slice(0, MAX_TTS_CHARS)}…` : text;
@@ -1694,6 +1703,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 
       const runSpeechSynthPulse = () => {
         const tick = (t0: number) => {
+          if (!isCurrentEpoch()) return;
           const t = (performance.now() - t0) / 1000;
           onSpeechValueRef.current?.(0.38 + Math.sin(t * 9.2) * 0.16);
           speechSynthRafRef.current = requestAnimationFrame(() => tick(t0));
@@ -1704,7 +1714,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       const bindSpeechSynthUtterance = (utterance: SpeechSynthesisUtterance) => {
         let synthStarted = false;
         utterance.onboundary = (ev) => {
-          if (!synthStarted) return;
+          if (!synthStarted || !isCurrentEpoch()) return;
           const ci = ev.charIndex;
           const cl = ev.charLength ?? 0;
           if (typeof ci !== 'number' || !Number.isFinite(ci) || ci < 0) return;
@@ -1713,11 +1723,13 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           setCloneTtsRevealLen(Math.min(speakSlice.length, Math.max(0, end)));
         };
         utterance.onstart = () => {
+          if (!isCurrentEpoch()) return;
           synthStarted = true;
           runSpeechSynthPulse();
           setCloneTtsRevealLen((n) => Math.max(n, 1));
         };
         utterance.onend = () => {
+          if (!isCurrentEpoch()) return;
           if (speechSynthRafRef.current != null) {
             cancelAnimationFrame(speechSynthRafRef.current);
             speechSynthRafRef.current = null;
@@ -1725,7 +1737,11 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           onSpeechValueRef.current?.(0);
           scheduleCloneTtsDone({ postSpeechHoldMs: CLONE_TTS_POST_SPEECH_HOLD_MS });
         };
-        utterance.onerror = () => {
+        utterance.onerror = (ev) => {
+          /** 安卓 Chrome：cancel() 同步触发 onerror（error=canceled），旧回合应忽略 */
+          if (!isCurrentEpoch()) return;
+          const errMsg = (ev as SpeechSynthesisErrorEvent)?.error;
+          if (errMsg === 'canceled' || errMsg === 'interrupted') return;
           if (speechSynthRafRef.current != null) {
             cancelAnimationFrame(speechSynthRafRef.current);
             speechSynthRafRef.current = null;
@@ -1805,7 +1821,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             const audio = new Audio(objectUrl);
             minimaxAudioRef.current = audio;
 
-            const ctx = new AudioContext();
+            const ACtor = window.AudioContext || (window as any).webkitAudioContext;
+            if (!ACtor) throw new Error('AudioContext not supported');
+            const ctx = new ACtor();
             minimaxAudioCtxRef.current = ctx;
             const src = ctx.createMediaElementSource(audio);
             const analyser = ctx.createAnalyser();
