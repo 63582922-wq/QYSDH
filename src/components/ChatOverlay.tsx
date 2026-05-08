@@ -604,44 +604,6 @@ function parseStoredSessions(raw: string | null): ChatSession[] {
   }
 }
 
-/** 触摸机 SpeechRecognition：第二次点「完成」后稍晚再 stop，降低 onend 早于最后一条 final 的概率 */
-function getCloneDictationStopLeadMs(): number {
-  if (typeof window === 'undefined') return 220;
-  try {
-    if (window.matchMedia('(pointer: coarse)').matches) return 340;
-    if ('ontouchstart' in window) return 280;
-  } catch {
-    /* ignore */
-  }
-  return 220;
-}
-
-/** onend 时首读全文仍为空：部分 Android 上 final 片段略晚抵达，短延迟再读 ref（此前勿清空 accum） */
-function getCloneDictationLateTextCatchupMs(): number {
-  if (typeof window === 'undefined') return 280;
-  try {
-    if (window.matchMedia('(pointer: coarse)').matches) return 420;
-    if ('ontouchstart' in window) return 340;
-  } catch {
-    /* ignore */
-  }
-  return 280;
-}
-
-/**
- * 手机常见竞态：SpeechRecognition 与第二条 getUserMedia（声纹 Analyser）同时占麦，识别结果长期为空或 onend 异常。
- * 触摸/粗指针设备上跳过声纹麦克风流，仅保留 Web Speech（波形区无能量但可正常出字）。
- */
-function shouldSkipCloneMicForSpeechDictation(): boolean {
-  if (typeof window === 'undefined') return false;
-  try {
-    if (window.matchMedia('(pointer: coarse)').matches) return true;
-  } catch {
-    /* ignore */
-  }
-  return 'ontouchstart' in window;
-}
-
 function sanitizeModelReplyText(text: string): string {
   let s = stripReasoningArtifacts(typeof text === 'string' ? text : String(text ?? ''));
   s = s.replace(/\u0000/g, '');
@@ -843,6 +805,84 @@ function extractModelReplyText(response: unknown, fallback: string): string {
   }
 
   return safeFallback;
+}
+
+/** 复刻：MediaRecorder 上传后由 Gemini 多模态转写（与对话主链路一致用 Flash） */
+const CLONE_TRANSCRIBE_MODEL = 'gemini-2.5-flash';
+const CLONE_MEDIA_RECORDER_SLICE_MS = 400;
+const MAX_CLONE_TRANSCRIBE_BYTES = 18 * 1024 * 1024;
+const CLONE_TRANSCRIBE_TIMEOUT_MS = 90_000;
+
+function pickMediaRecorderMimeType(): string | undefined {
+  if (typeof MediaRecorder === 'undefined') return undefined;
+  const list = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4;codecs=mp4a.40.2',
+    'audio/mp4',
+  ];
+  for (const t of list) {
+    try {
+      if (MediaRecorder.isTypeSupported(t)) return t;
+    } catch {
+      /* ignore */
+    }
+  }
+  return undefined;
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  const chunk = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunk) {
+    const sub = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+    binary += String.fromCharCode.apply(null, sub as unknown as number[]);
+  }
+  return btoa(binary);
+}
+
+async function transcribeCloneAudioWithGeminiFlash(opts: {
+  blob: Blob;
+  language: 'zh' | 'en';
+}): Promise<string> {
+  const { blob, language } = opts;
+  const buf = await blob.arrayBuffer();
+  if (buf.byteLength === 0) return '';
+  if (buf.byteLength > MAX_CLONE_TRANSCRIBE_BYTES) {
+    throw new Error('CLONE_AUDIO_TOO_LARGE');
+  }
+  const rawMime = (blob.type && blob.type.trim()) || 'audio/webm';
+  const mimeType = rawMime.split(';')[0]!.trim();
+  const prompt =
+    language === 'zh'
+      ? '请逐字转写下段音频中的口述内容。只输出转写正文，不要翻译、不要引号、不要任何解释或开场白。忽略非人类语音与杂音。'
+      : 'Transcribe all spoken words in the attached audio verbatim into plain text only. No quotes, no preamble or commentary. Ignore non-human noise.';
+
+  const data = uint8ArrayToBase64(new Uint8Array(buf));
+  const run = () =>
+    getGeminiClient().models.generateContent({
+      model: CLONE_TRANSCRIBE_MODEL,
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }, { inlineData: { mimeType, data } }],
+        },
+      ],
+      config: { temperature: 0.1 },
+    });
+
+  const response = await Promise.race([
+    run(),
+    new Promise<never>((_, reject) => {
+      window.setTimeout(() => reject(new Error('CLIENT_TIMEOUT')), CLONE_TRANSCRIBE_TIMEOUT_MS);
+    }),
+  ]);
+  const t = extractModelReplyText(response, '').trim();
+  try {
+    return sanitizeModelReplyText(t).trim();
+  } catch {
+    return t.replace(/\u0000/g, '').trim();
+  }
 }
 
 function formatProviderChatError(
@@ -1082,26 +1122,14 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   /** Live：首段 PCM 排程在未来时刻时，推迟 setIsSpeaking(true)，避免声纹早于扬声器出声 */
   const liveAiSpeakingDelayTimerRef = useRef<number | null>(null);
 
-  /** 复刻链路：浏览器 SpeechRecognition → 点按开始录音，再点完成发送（不走 Live） */
+  /** 复刻链路：MediaRecorder → Gemini 2.5 Flash 转写 → 文本发送（不走 Live / 不用浏览器 SpeechRecognition） */
   const [isCloneDictating, setIsCloneDictating] = useState(false);
-  const cloneDictationRecognitionRef = useRef<SpeechRecognition | null>(null);
-  const cloneDictationAccumRef = useRef('');
-  const cloneDictationInterimRef = useRef('');
+  const cloneMediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const cloneRecordChunksRef = useRef<Blob[]>([]);
   const cloneHoldSnapshotRef = useRef('');
-  const cloneHoldOutcomeRef = useRef<'send' | 'cancel' | null>(null);
   const cloneHoldCleanupStopRef = useRef(false);
-  /** 已开始识别、等待用户第二次点按「完成」；用于 WebKit 过早 onend 时重开识别 */
-  const cloneAwaitingStopTapRef = useRef(false);
-  /** 听写 interim 极高频：合并为每帧至多一次 setState，避免主线程被 React 重绘占满（体感「卡死」） */
-  const cloneCaptionFlushRafRef = useRef<number | null>(null);
-  /** 第二次点「完成」后延迟 stop，给 Chrome/Android 派发最后一条 final onresult 的时间，避免空文本不发送 */
-  const cloneDictationStopTimerRef = useRef<number | null>(null);
-  /** onend 时若首读全文为空，延迟再读 accum（勿与过早清空 ref 竞态） */
-  const cloneDictationLateSendTimerRef = useRef<number | null>(null);
-  /** 部分机型 onend 丢失：在「完成」点按后再兜底读 ref 发送一次 */
-  const cloneDictationVoiceFallbackTimerRef = useRef<number | null>(null);
-  /** 复刻语音本轮是否已成功触发 sendMessage，避免 onend + 兜底双发 */
-  const cloneVoiceSendCommittedRef = useRef(false);
+  /** stopCloneDictation({ cleanup }) / 切模式时递增，进行中的录音或转写检测到代数变化则放弃发送 */
+  const cloneDictationEpochRef = useRef(0);
   /** 点按说话：字幕与声纹同步，不写输入框 */
   const [cloneLiveCaptionUserLine, setCloneLiveCaptionUserLine] = useState('');
   const [cloneUserPostDictationHold, setCloneUserPostDictationHold] = useState(false);
@@ -1146,17 +1174,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     }, CLONE_USER_POST_DICTATION_HOLD_MS);
   }, []);
 
-  /** 取消待合并的 rAF，立刻把 accum/interim ref 同步到字幕 state（完成点按 / onend 前用，避免漏字） */
-  const flushCloneCaptionFromRefs = useCallback(() => {
-    if (cloneCaptionFlushRafRef.current != null) {
-      cancelAnimationFrame(cloneCaptionFlushRafRef.current);
-      cloneCaptionFlushRafRef.current = null;
-    }
-    const mid = cloneDictationAccumRef.current.trim();
-    const tail = cloneDictationInterimRef.current.trim();
-    setCloneLiveCaptionUserLine([mid, tail].filter((x) => x.length > 0).join(' ').trim());
-  }, []);
-
   const stopCloneUserMicCapture = useCallback(() => {
     cloneUserMicAnalyserRef.current = null;
     try {
@@ -1172,31 +1189,28 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     setCloneUserMicPrimed((n) => n + 1);
   }, []);
 
-  const startCloneUserMicCapture = useCallback(() => {
-    stopCloneUserMicCapture();
-    void (async () => {
+  /** 将已授权的麦克风流接到声纹 Analyser（与 MediaRecorder 共用同一条 stream） */
+  const attachCloneMicAnalyserFromStream = useCallback(
+    async (stream: MediaStream) => {
+      cloneUserMicStreamRef.current = stream;
+      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      const AC = Ctx ?? AudioContext;
+      const ctx = new AC();
+      cloneUserMicCtxRef.current = ctx;
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+      cloneUserMicAnalyserRef.current = analyser;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        if (conversationModeRef.current !== 'text_clone') {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        cloneUserMicStreamRef.current = stream;
-        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new Ctx();
-        cloneUserMicCtxRef.current = ctx;
-        const src = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        src.connect(analyser);
-        cloneUserMicAnalyserRef.current = analyser;
         await ctx.resume();
-        setCloneUserMicPrimed((n) => n + 1);
-      } catch (e) {
-        console.warn('[Clone user mic]', e);
+      } catch {
+        /* ignore */
       }
-    })();
-  }, [stopCloneUserMicCapture]);
+      setCloneUserMicPrimed((n) => n + 1);
+    },
+    [],
+  );
 
   const isAIActive = isTyping || isSpeaking || isVoiceConnecting;
 
@@ -2487,281 +2501,150 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   sendMessageRef.current = sendMessage;
 
-  const beginCloneHoldSpeechRecognition = (): boolean => {
+  const beginCloneHoldSpeechRecognition = (): void => {
     if (!window.isSecureContext) {
       setVoiceBlockingMessage(
         language === 'zh' ? '语音输入需通过安全连接（HTTPS）使用。' : 'Voice input requires a secure (HTTPS) connection.',
       );
-      return false;
+      return;
     }
-    setCloneLiveCaptionUserLine('');
-    if (cloneDictationLateSendTimerRef.current != null) {
-      window.clearTimeout(cloneDictationLateSendTimerRef.current);
-      cloneDictationLateSendTimerRef.current = null;
-    }
-    if (cloneDictationVoiceFallbackTimerRef.current != null) {
-      window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-      cloneDictationVoiceFallbackTimerRef.current = null;
-    }
-    if (cloneDictationStopTimerRef.current != null) {
-      window.clearTimeout(cloneDictationStopTimerRef.current);
-      cloneDictationStopTimerRef.current = null;
-    }
-    if (cloneCaptionFlushRafRef.current != null) {
-      cancelAnimationFrame(cloneCaptionFlushRafRef.current);
-      cloneCaptionFlushRafRef.current = null;
-    }
-    cloneVoiceSendCommittedRef.current = false;
-    type SRCtor = new () => SpeechRecognition;
-    const w = window as Window & { SpeechRecognition?: SRCtor; webkitSpeechRecognition?: SRCtor };
-    const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!SR) {
+    if (typeof MediaRecorder === 'undefined') {
       setVoiceBlockingMessage(
-        language === 'zh' ? '当前浏览器不支持网页语音识别。' : 'Speech recognition is not supported in this browser.',
+        language === 'zh' ? '当前浏览器不支持录音转写。' : 'Recording is not supported in this browser.',
       );
-      return false;
+      return;
+    }
+    if (!getGeminiApiKey()) {
+      setVoiceBlockingMessage(
+        language === 'zh' ? '未配置对话服务，无法使用语音转写。' : 'Chat service is not configured for transcription.',
+      );
+      return;
     }
 
+    setCloneLiveCaptionUserLine('');
     stopCloneUserMicCapture();
-    if (!shouldSkipCloneMicForSpeechDictation()) {
-      startCloneUserMicCapture();
-    }
+    cloneMediaRecorderRef.current = null;
+    cloneRecordChunksRef.current = [];
+    cloneHoldCleanupStopRef.current = false;
 
-    const bindCloneDictationHandlers = (rec: SpeechRecognition, restartDepth: number) => {
-      rec.lang = language === 'zh' ? 'zh-CN' : 'en-US';
-      rec.continuous = true;
-      rec.interimResults = true;
-      rec.maxAlternatives = 1;
-
-      rec.onresult = (event: SpeechRecognitionEvent) => {
-        let interim = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const r = event.results[i];
-          if (r.isFinal) {
-            cloneDictationAccumRef.current += r[0]?.transcript ?? '';
-          } else {
-            interim += r[0]?.transcript ?? '';
-          }
-        }
-        cloneDictationInterimRef.current = interim.trim();
-        if (cloneCaptionFlushRafRef.current != null) return;
-        cloneCaptionFlushRafRef.current = requestAnimationFrame(() => {
-          cloneCaptionFlushRafRef.current = null;
-          const mid = cloneDictationAccumRef.current.trim();
-          const tail = cloneDictationInterimRef.current.trim();
-          const line = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
-          setCloneLiveCaptionUserLine(line);
-        });
-      };
-
-      rec.onerror = (ev: SpeechRecognitionErrorEvent) => {
-        /** no-speech / aborted 为常见无害事件，勿打成 warn 以免误以为整条语音链路故障 */
-        if (ev.error !== 'no-speech' && ev.error !== 'aborted') {
-          console.warn('[Clone dictation]', ev.error);
-        }
-        /** 用户点「完成」后 stop()：Chrome/Android 常先发 aborted，若清空 outcome，onend 会丢失发送意图 */
-        const benignAbort =
-          (ev.error === 'aborted' || ev.error === 'no-speech') && cloneHoldOutcomeRef.current === 'send';
-        if (benignAbort) {
-          if (cloneDictationStopTimerRef.current != null) {
-            window.clearTimeout(cloneDictationStopTimerRef.current);
-            cloneDictationStopTimerRef.current = null;
-          }
-          if (cloneDictationLateSendTimerRef.current != null) {
-            window.clearTimeout(cloneDictationLateSendTimerRef.current);
-            cloneDictationLateSendTimerRef.current = null;
-          }
-          if (cloneCaptionFlushRafRef.current != null) {
-            cancelAnimationFrame(cloneCaptionFlushRafRef.current);
-            cloneCaptionFlushRafRef.current = null;
-          }
+    void (async () => {
+      const epoch = cloneDictationEpochRef.current;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (epoch !== cloneDictationEpochRef.current || conversationModeRef.current !== 'text_clone') {
+          stream.getTracks().forEach((t) => t.stop());
           return;
-        }
-        if (cloneDictationStopTimerRef.current != null) {
-          window.clearTimeout(cloneDictationStopTimerRef.current);
-          cloneDictationStopTimerRef.current = null;
-        }
-        if (cloneDictationLateSendTimerRef.current != null) {
-          window.clearTimeout(cloneDictationLateSendTimerRef.current);
-          cloneDictationLateSendTimerRef.current = null;
-        }
-        if (cloneDictationVoiceFallbackTimerRef.current != null) {
-          window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-          cloneDictationVoiceFallbackTimerRef.current = null;
-        }
-        cloneHoldOutcomeRef.current = null;
-        cloneAwaitingStopTapRef.current = false;
-        if (cloneCaptionFlushRafRef.current != null) {
-          cancelAnimationFrame(cloneCaptionFlushRafRef.current);
-          cloneCaptionFlushRafRef.current = null;
-        }
-        setInputText(cloneHoldSnapshotRef.current.trim());
-        setCloneLiveCaptionUserLine('');
-        cloneDictationAccumRef.current = '';
-        cloneDictationInterimRef.current = '';
-        cloneVoiceSendCommittedRef.current = false;
-        stopCloneUserMicCapture();
-        if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-          setVoiceBlockingMessage(
-            language === 'zh'
-              ? '无法使用麦克风：请在浏览器中允许本站访问麦克风。'
-              : 'Microphone blocked. Allow mic access for this site.',
-          );
-        }
-        cloneDictationRecognitionRef.current = null;
-        setIsCloneDictating(false);
-        try {
-          rec.stop();
-        } catch {
-          /* ignore */
-        }
-      };
-
-      rec.onend = () => {
-        if (cloneCaptionFlushRafRef.current != null) {
-          cancelAnimationFrame(cloneCaptionFlushRafRef.current);
-          cloneCaptionFlushRafRef.current = null;
         }
         if (cloneHoldCleanupStopRef.current) {
-          cloneDictationRecognitionRef.current = null;
-          setIsCloneDictating(false);
-          cloneHoldCleanupStopRef.current = false;
-          cloneHoldOutcomeRef.current = null;
-          cloneAwaitingStopTapRef.current = false;
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        await attachCloneMicAnalyserFromStream(stream);
+        if (epoch !== cloneDictationEpochRef.current || conversationModeRef.current !== 'text_clone') {
+          stopCloneUserMicCapture();
+          return;
+        }
+        if (cloneHoldCleanupStopRef.current) {
+          stopCloneUserMicCapture();
           return;
         }
 
-        const awaitingStopTap = cloneAwaitingStopTapRef.current;
-        const outcome = cloneHoldOutcomeRef.current;
-
-        /** iOS / 部分 WebKit 会过早结束 continuous 会话：仍在录音阶段且无「完成」结论时换实例重开 */
-        if (awaitingStopTap && outcome == null && restartDepth < 22) {
-          try {
-            const next = new SR();
-            bindCloneDictationHandlers(next, restartDepth + 1);
-            cloneDictationRecognitionRef.current = next;
-            next.start();
-            setIsCloneDictating(true);
-            cloneAwaitingStopTapRef.current = true;
-            return;
-          } catch (e2) {
-            console.warn('[Clone dictation] re-arm failed', e2);
-          }
-        }
-
-        cloneDictationRecognitionRef.current = null;
-        setIsCloneDictating(false);
-
-        const oc = outcome;
-        cloneHoldOutcomeRef.current = null;
-        cloneAwaitingStopTapRef.current = false;
-
-        if (oc === 'send') {
-          flushCloneCaptionFromRefs();
-        }
-
-        if (oc == null) {
-          if (cloneDictationVoiceFallbackTimerRef.current != null) {
-            window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-            cloneDictationVoiceFallbackTimerRef.current = null;
-          }
-          setCloneLiveCaptionUserLine('');
-          cloneDictationAccumRef.current = '';
-          cloneDictationInterimRef.current = '';
-          cloneVoiceSendCommittedRef.current = false;
-          return;
-        }
-
-        if (oc === 'cancel') {
-          if (cloneDictationVoiceFallbackTimerRef.current != null) {
-            window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-            cloneDictationVoiceFallbackTimerRef.current = null;
-          }
-          setInputText(cloneHoldSnapshotRef.current.trim());
-          setCloneLiveCaptionUserLine('');
-          cloneDictationAccumRef.current = '';
-          cloneDictationInterimRef.current = '';
-          cloneVoiceSendCommittedRef.current = false;
-          return;
-        }
-
-        const mid = cloneDictationAccumRef.current.trim();
-        const tail = cloneDictationInterimRef.current.trim();
-        const full = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
-
-        if (!full) {
-          if (oc === 'send') {
-            if (cloneDictationLateSendTimerRef.current != null) {
-              window.clearTimeout(cloneDictationLateSendTimerRef.current);
+        const mime = pickMediaRecorderMimeType();
+        const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        cloneRecordChunksRef.current = [];
+        rec.ondataavailable = (ev) => {
+          if (ev.data.size > 0) cloneRecordChunksRef.current.push(ev.data);
+          let sum = 0;
+          for (const b of cloneRecordChunksRef.current) sum += b.size;
+          if (sum > MAX_CLONE_TRANSCRIBE_BYTES) {
+            try {
+              rec.stop();
+            } catch {
+              /* ignore */
             }
-            cloneDictationLateSendTimerRef.current = window.setTimeout(() => {
-              cloneDictationLateSendTimerRef.current = null;
-              flushCloneCaptionFromRefs();
-              const mid2 = cloneDictationAccumRef.current.trim();
-              const tail2 = cloneDictationInterimRef.current.trim();
-              const full2 = [mid2, tail2].filter((x) => x.length > 0).join(' ').trim();
-              cloneDictationAccumRef.current = '';
-              cloneDictationInterimRef.current = '';
-              if (full2) {
-                if (cloneDictationVoiceFallbackTimerRef.current != null) {
-                  window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-                  cloneDictationVoiceFallbackTimerRef.current = null;
-                }
-                cloneVoiceSendCommittedRef.current = true;
-                setInputText(cloneHoldSnapshotRef.current.trim());
-                armCloneUserDictationHoldAfterSend(full2);
-                setCloneLiveCaptionUserLine('');
-                sendMessageRef.current({ textOverride: full2, preserveInputFromVoiceHold: true });
-              } else {
-                setInputText(cloneHoldSnapshotRef.current.trim());
-                setCloneLiveCaptionUserLine('');
-              }
-            }, getCloneDictationLateTextCatchupMs());
+          }
+        };
+        rec.onerror = () => {
+          cloneMediaRecorderRef.current = null;
+          setIsCloneDictating(false);
+          setCloneLiveCaptionUserLine('');
+          stopCloneUserMicCapture();
+          setVoiceBlockingMessage(language === 'zh' ? '录音出错，请重试。' : 'Recording error. Try again.');
+        };
+        rec.onstop = async () => {
+          cloneMediaRecorderRef.current = null;
+          const discard = cloneHoldCleanupStopRef.current;
+          cloneHoldCleanupStopRef.current = false;
+          const chunks = cloneRecordChunksRef.current;
+          cloneRecordChunksRef.current = [];
+          const mimeOut = (rec.mimeType && rec.mimeType.trim()) || mime || 'audio/webm';
+          const blob = new Blob(chunks, { type: mimeOut });
+          stopCloneUserMicCapture();
+
+          if (
+            discard ||
+            conversationModeRef.current !== 'text_clone' ||
+            epoch !== cloneDictationEpochRef.current
+          ) {
+            setIsCloneDictating(false);
+            setCloneLiveCaptionUserLine('');
             return;
           }
-          if (cloneDictationVoiceFallbackTimerRef.current != null) {
-            window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-            cloneDictationVoiceFallbackTimerRef.current = null;
-          }
-          cloneDictationAccumRef.current = '';
-          cloneDictationInterimRef.current = '';
-          setInputText(cloneHoldSnapshotRef.current.trim());
-          setCloneLiveCaptionUserLine('');
-          cloneVoiceSendCommittedRef.current = false;
-          return;
-        }
-        if (cloneDictationVoiceFallbackTimerRef.current != null) {
-          window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-          cloneDictationVoiceFallbackTimerRef.current = null;
-        }
-        cloneVoiceSendCommittedRef.current = true;
-        cloneDictationAccumRef.current = '';
-        cloneDictationInterimRef.current = '';
-        setInputText(cloneHoldSnapshotRef.current.trim());
-        armCloneUserDictationHoldAfterSend(full);
-        setCloneLiveCaptionUserLine('');
-        sendMessageRef.current({ textOverride: full, preserveInputFromVoiceHold: true });
-      };
-    };
 
-    const rec0 = new SR();
-    bindCloneDictationHandlers(rec0, 0);
-    try {
-      cloneDictationRecognitionRef.current = rec0;
-      rec0.start();
-      setIsCloneDictating(true);
-      cloneAwaitingStopTapRef.current = true;
-      return true;
-    } catch (e) {
-      console.warn('SpeechRecognition.start failed', e);
-      cloneDictationRecognitionRef.current = null;
-      cloneAwaitingStopTapRef.current = false;
-      stopCloneUserMicCapture();
-      setVoiceBlockingMessage(
-        language === 'zh' ? '无法启动语音识别，请稍后重试。' : 'Could not start speech recognition.',
-      );
-      return false;
-    }
+          setCloneLiveCaptionUserLine(language === 'zh' ? '正在识别…' : 'Transcribing…');
+          try {
+            const text = await transcribeCloneAudioWithGeminiFlash({ blob, language });
+            if (epoch !== cloneDictationEpochRef.current || conversationModeRef.current !== 'text_clone') {
+              setCloneLiveCaptionUserLine('');
+              setIsCloneDictating(false);
+              return;
+            }
+            const full = text.trim();
+            setCloneLiveCaptionUserLine('');
+            if (!full) {
+              setInputText(cloneHoldSnapshotRef.current.trim());
+              setVoiceBlockingMessage(
+                language === 'zh' ? '未识别到语音内容，请再试一次。' : 'No speech detected. Try again.',
+              );
+              setIsCloneDictating(false);
+              return;
+            }
+            setInputText(cloneHoldSnapshotRef.current.trim());
+            armCloneUserDictationHoldAfterSend(full);
+            sendMessageRef.current({ textOverride: full, preserveInputFromVoiceHold: true });
+          } catch (e) {
+            console.warn('[Clone transcribe]', e);
+            setCloneLiveCaptionUserLine('');
+            setInputText(cloneHoldSnapshotRef.current.trim());
+            const msg = String((e as Error)?.message ?? e ?? '');
+            if (msg === 'CLONE_AUDIO_TOO_LARGE') {
+              setVoiceBlockingMessage(
+                language === 'zh' ? '录音过长，请分段录制。' : 'Recording too long. Try a shorter clip.',
+              );
+            } else {
+              setVoiceBlockingMessage(
+                language === 'zh' ? '语音转写出错，请改用键盘输入或稍后重试。' : 'Transcription failed. Type or try again later.',
+              );
+            }
+          } finally {
+            setIsCloneDictating(false);
+          }
+        };
+
+        cloneMediaRecorderRef.current = rec;
+        rec.start(CLONE_MEDIA_RECORDER_SLICE_MS);
+        setIsCloneDictating(true);
+        setCloneLiveCaptionUserLine(
+          language === 'zh' ? '正在录音，再点一下麦克风完成并发送' : 'Recording… tap the mic again to send',
+        );
+      } catch (e) {
+        console.warn('[Clone record start]', e);
+        stopCloneUserMicCapture();
+        setVoiceBlockingMessage(
+          language === 'zh' ? '无法使用麦克风，请允许权限后重试。' : 'Could not access the microphone. Allow access and retry.',
+        );
+      }
+    })();
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -3508,37 +3391,25 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const stopCloneDictation = useCallback(
     (opts?: { cleanup?: boolean }) => {
-      if (cloneDictationVoiceFallbackTimerRef.current != null) {
-        window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-        cloneDictationVoiceFallbackTimerRef.current = null;
-      }
-      if (cloneDictationLateSendTimerRef.current != null) {
-        window.clearTimeout(cloneDictationLateSendTimerRef.current);
-        cloneDictationLateSendTimerRef.current = null;
-      }
-      if (cloneDictationStopTimerRef.current != null) {
-        window.clearTimeout(cloneDictationStopTimerRef.current);
-        cloneDictationStopTimerRef.current = null;
-      }
-      if (cloneCaptionFlushRafRef.current != null) {
-        cancelAnimationFrame(cloneCaptionFlushRafRef.current);
-        cloneCaptionFlushRafRef.current = null;
-      }
-      const r = cloneDictationRecognitionRef.current;
       if (opts?.cleanup) {
         cloneHoldCleanupStopRef.current = true;
+        cloneDictationEpochRef.current += 1;
       }
-      if (r) {
-        cloneDictationRecognitionRef.current = null;
+      const mr = cloneMediaRecorderRef.current;
+      cloneMediaRecorderRef.current = null;
+      cloneRecordChunksRef.current = [];
+      if (mr && mr.state !== 'inactive') {
         try {
-          r.stop();
+          mr.stop();
         } catch {
-          /* ignore */
+          setIsCloneDictating(false);
+          cloneHoldCleanupStopRef.current = false;
+          stopCloneUserMicCapture();
         }
+      } else {
+        setIsCloneDictating(false);
+        stopCloneUserMicCapture();
       }
-      setIsCloneDictating(false);
-      cloneAwaitingStopTapRef.current = false;
-      stopCloneUserMicCapture();
     },
     [stopCloneUserMicCapture],
   );
@@ -3548,52 +3419,22 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     if (conversationMode !== 'text_clone' || isTyping) return;
 
     if (isCloneDictating) {
-      if (cloneDictationStopTimerRef.current != null) {
-        return;
-      }
-      if (!cloneDictationRecognitionRef.current) {
+      const mr = cloneMediaRecorderRef.current;
+      if (!mr || mr.state === 'inactive') {
         stopCloneDictation();
         return;
       }
-      flushCloneCaptionFromRefs();
-      cloneHoldOutcomeRef.current = 'send';
-      cloneVoiceSendCommittedRef.current = false;
-      if (cloneDictationVoiceFallbackTimerRef.current != null) {
-        window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-        cloneDictationVoiceFallbackTimerRef.current = null;
-      }
-      cloneDictationVoiceFallbackTimerRef.current = window.setTimeout(() => {
-        cloneDictationVoiceFallbackTimerRef.current = null;
-        if (cloneVoiceSendCommittedRef.current) return;
-        flushCloneCaptionFromRefs();
-        const midF = cloneDictationAccumRef.current.trim();
-        const tailF = cloneDictationInterimRef.current.trim();
-        const fullF = [midF, tailF].filter((x) => x.length > 0).join(' ').trim();
-        cloneDictationAccumRef.current = '';
-        cloneDictationInterimRef.current = '';
-        if (fullF) {
-          cloneVoiceSendCommittedRef.current = true;
-          setInputText(cloneHoldSnapshotRef.current.trim());
-          armCloneUserDictationHoldAfterSend(fullF);
-          setCloneLiveCaptionUserLine('');
-          sendMessageRef.current({ textOverride: fullF, preserveInputFromVoiceHold: true });
-        } else {
-          setInputText(cloneHoldSnapshotRef.current.trim());
-          setCloneLiveCaptionUserLine('');
-        }
-      }, 1500);
-      cloneDictationStopTimerRef.current = window.setTimeout(() => {
-        cloneDictationStopTimerRef.current = null;
+      setCloneLiveCaptionUserLine(language === 'zh' ? '正在识别…' : 'Transcribing…');
+      try {
+        mr.stop();
+      } catch {
         stopCloneDictation();
-      }, getCloneDictationStopLeadMs());
+      }
       return;
     }
 
     clearCloneUserDictationHold();
     cloneHoldSnapshotRef.current = inputTextRef.current;
-    cloneDictationAccumRef.current = '';
-    cloneDictationInterimRef.current = '';
-    cloneHoldOutcomeRef.current = null;
     cloneHoldCleanupStopRef.current = false;
 
     try {
@@ -3602,7 +3443,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       /* ignore */
     }
 
-    void beginCloneHoldSpeechRecognition();
+    beginCloneHoldSpeechRecognition();
   };
 
   useEffect(() => {
@@ -3657,7 +3498,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     let cancelled = false;
     const W = VOICEPRINT_CANVAS_W;
     const H = VOICEPRINT_CANVAS_H;
-    /** 复刻听写时降频画声纹（仍用同一套 RMS）；减轻与 SpeechRecognition 抢主线程 */
+    /** 复刻听写时降频画声纹（仍用同一套 RMS）；减轻与录音/转写争用主线程 */
     const CLONE_VOICERPRINT_MIN_INTERVAL_MS = 52;
     let cloneVoiceprintLastDrawMs = 0;
 
@@ -3913,7 +3754,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
     }
   }, [isOpen, isVoiceMode, isVoiceConnecting, liveVoiceHandoff]);
 
-  // Cleanup：仅清计时器与浏览器语音识别（语音会话由 isOpen / 用户按键管理）
+  // Cleanup：仅清计时器与复刻 MediaRecorder（语音会话由 isOpen / 用户按键管理）
   useEffect(() => {
     return () => {
       clearFloatingDisplayTimers();
@@ -3921,25 +3762,18 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         window.clearTimeout(cloneUserDictationHoldTimerRef.current);
         cloneUserDictationHoldTimerRef.current = null;
       }
-      if (cloneDictationLateSendTimerRef.current != null) {
-        window.clearTimeout(cloneDictationLateSendTimerRef.current);
-        cloneDictationLateSendTimerRef.current = null;
-      }
-      if (cloneDictationVoiceFallbackTimerRef.current != null) {
-        window.clearTimeout(cloneDictationVoiceFallbackTimerRef.current);
-        cloneDictationVoiceFallbackTimerRef.current = null;
-      }
-      if (cloneDictationStopTimerRef.current != null) {
-        window.clearTimeout(cloneDictationStopTimerRef.current);
-        cloneDictationStopTimerRef.current = null;
-      }
+      cloneDictationEpochRef.current += 1;
       cloneHoldCleanupStopRef.current = true;
-      try {
-        cloneDictationRecognitionRef.current?.stop();
-      } catch {
-        /* ignore */
+      const mr = cloneMediaRecorderRef.current;
+      cloneMediaRecorderRef.current = null;
+      cloneRecordChunksRef.current = [];
+      if (mr && mr.state !== 'inactive') {
+        try {
+          mr.stop();
+        } catch {
+          /* ignore */
+        }
       }
-      cloneDictationRecognitionRef.current = null;
       stopCloneUserMicCapture();
     };
   }, [clearFloatingDisplayTimers, stopCloneUserMicCapture]);
