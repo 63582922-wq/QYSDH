@@ -547,6 +547,30 @@ function safeMsgText(t: unknown): string {
   return '';
 }
 
+/** 触摸机 SpeechRecognition：第二次点「完成」后稍晚再 stop，降低 onend 早于最后一条 final 的概率 */
+function getCloneDictationStopLeadMs(): number {
+  if (typeof window === 'undefined') return 220;
+  try {
+    if (window.matchMedia('(pointer: coarse)').matches) return 340;
+    if ('ontouchstart' in window) return 280;
+  } catch {
+    /* ignore */
+  }
+  return 220;
+}
+
+/** onend 时首读全文仍为空：部分 Android 上 final 片段略晚抵达，短延迟再读 ref（此前勿清空 accum） */
+function getCloneDictationLateTextCatchupMs(): number {
+  if (typeof window === 'undefined') return 280;
+  try {
+    if (window.matchMedia('(pointer: coarse)').matches) return 420;
+    if ('ontouchstart' in window) return 340;
+  } catch {
+    /* ignore */
+  }
+  return 280;
+}
+
 function sanitizeModelReplyText(text: string): string {
   let s = stripReasoningArtifacts(typeof text === 'string' ? text : String(text ?? ''));
   s = s.replace(/\u0000/g, '');
@@ -698,13 +722,56 @@ function mergeStreamingTranscript(prev: string, incoming: string): string {
 }
 
 function extractModelReplyText(response: unknown, fallback: string): string {
+  const safeFallback =
+    typeof fallback === 'string' && fallback.trim().length > 0
+      ? (() => {
+          try {
+            return sanitizeModelReplyText(fallback.trim());
+          } catch {
+            return fallback.trim().slice(0, MAX_REPLY_CHARS);
+          }
+        })()
+      : '…';
+
+  const trySanitize = (raw: string): string | null => {
+    const t = raw.trim();
+    if (!t) return null;
+    try {
+      return sanitizeModelReplyText(t);
+    } catch {
+      return t.length > MAX_REPLY_CHARS ? `${t.slice(0, MAX_REPLY_CHARS)}…` : t;
+    }
+  };
+
   try {
-    const t = (response as { text?: string })?.text;
-    if (typeof t === 'string' && t.trim()) return sanitizeModelReplyText(t.trim());
+    const top = (response as { text?: unknown })?.text;
+    if (typeof top === 'string') {
+      const out = trySanitize(top);
+      if (out) return out;
+    }
+  } catch {
+    /* GenerateContentResponse.text 在异常体上可能抛错（WebView 上更常见） */
+  }
+
+  try {
+    const cands = (response as { candidates?: unknown[] })?.candidates;
+    if (!Array.isArray(cands) || cands.length === 0) return safeFallback;
+    const parts = (cands[0] as { content?: { parts?: unknown[] } })?.content?.parts;
+    if (!Array.isArray(parts)) return safeFallback;
+    const chunks: string[] = [];
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue;
+      const tx = (p as { text?: unknown }).text;
+      if (typeof tx === 'string' && tx.length > 0) chunks.push(tx);
+    }
+    const joined = chunks.join('').trim();
+    const out = trySanitize(joined);
+    if (out) return out;
   } catch {
     /* ignore */
   }
-  return fallback;
+
+  return safeFallback;
 }
 
 function formatProviderChatError(
@@ -958,6 +1025,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneCaptionFlushRafRef = useRef<number | null>(null);
   /** 第二次点「完成」后延迟 stop，给 Chrome/Android 派发最后一条 final onresult 的时间，避免空文本不发送 */
   const cloneDictationStopTimerRef = useRef<number | null>(null);
+  /** onend 时若首读全文为空，延迟再读 accum（勿与过早清空 ref 竞态） */
+  const cloneDictationLateSendTimerRef = useRef<number | null>(null);
   /** 点按说话：字幕与声纹同步，不写输入框 */
   const [cloneLiveCaptionUserLine, setCloneLiveCaptionUserLine] = useState('');
   const [cloneUserPostDictationHold, setCloneUserPostDictationHold] = useState(false);
@@ -1136,63 +1205,80 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   /** 复刻：与 Live 对齐的字幕数据源（主界面不渲染气泡历史） */
   const cloneCaptionState = useMemo(() => {
     if (conversationMode !== 'text_clone') return null;
-    const msgs = activeSession?.messages ?? [];
-    let lastUser = '';
-    let lastUserIdx = -1;
-    let lastUserImage: string | undefined;
-    for (let i = msgs.length - 1; i >= 0; i -= 1) {
-      if (msgs[i].role === 'user') {
-        lastUser = safeMsgText(msgs[i].text).trim();
-        lastUserIdx = i;
-        lastUserImage = msgs[i].attachedImageDataUrl;
-        break;
+    try {
+      const msgs = activeSession?.messages ?? [];
+      let lastUser = '';
+      let lastUserIdx = -1;
+      let lastUserImage: string | undefined;
+      for (let i = msgs.length - 1; i >= 0; i -= 1) {
+        const row = msgs[i];
+        if (!row) continue;
+        if (row.role === 'user') {
+          lastUser = safeMsgText(row.text).trim();
+          lastUserIdx = i;
+          lastUserImage = row.attachedImageDataUrl;
+          break;
+        }
       }
-    }
-    let lastModel = '';
-    let lastModelIdx = -1;
-    for (let i = msgs.length - 1; i >= 0; i -= 1) {
-      if (msgs[i].role === 'model' && msgs[i].kind !== 'closing_note') {
-        lastModel = safeMsgText(msgs[i].text).trim();
-        lastModelIdx = i;
-        break;
+      let lastModel = '';
+      let lastModelIdx = -1;
+      for (let i = msgs.length - 1; i >= 0; i -= 1) {
+        const row = msgs[i];
+        if (!row) continue;
+        if (row.role === 'model' && row.kind !== 'closing_note') {
+          lastModel = safeMsgText(row.text).trim();
+          lastModelIdx = i;
+          break;
+        }
       }
-    }
-    const waitingForModel = lastUserIdx > lastModelIdx;
-    const ttsStreaming =
-      isAutoSpeak &&
-      cloneTtsPlaybackMsgIdx !== null &&
-      cloneTtsPlaybackMsgIdx === lastModelIdx &&
-      lastModelIdx >= 0;
-    /** 自动朗读：未进入本轮随播Reveal前绝不晒全文，避免「字先出来、声后到」 */
-    let aiMain = '';
-    if (lastModelIdx >= 0) {
-      if (cloneTtsPostSpeechHold) {
-        aiMain = lastModel;
-      } else if (ttsStreaming) {
-        const cap =
-          Number.isFinite(cloneTtsRevealLen) && cloneTtsRevealLen >= 0
-            ? Math.min(lastModel.length, cloneTtsRevealLen)
-            : 0;
-        aiMain = lastModel.slice(0, cap);
-      } else if (!isAutoSpeak) {
-        aiMain = lastModel;
+      const waitingForModel = lastUserIdx > lastModelIdx;
+      const ttsStreaming =
+        isAutoSpeak &&
+        cloneTtsPlaybackMsgIdx !== null &&
+        cloneTtsPlaybackMsgIdx === lastModelIdx &&
+        lastModelIdx >= 0;
+      /** 自动朗读：未进入本轮随播Reveal前绝不晒全文，避免「字先出来、声后到」 */
+      let aiMain = '';
+      if (lastModelIdx >= 0) {
+        if (cloneTtsPostSpeechHold) {
+          aiMain = lastModel;
+        } else if (ttsStreaming) {
+          const cap =
+            Number.isFinite(cloneTtsRevealLen) && cloneTtsRevealLen >= 0
+              ? Math.min(lastModel.length, cloneTtsRevealLen)
+              : 0;
+          aiMain = lastModel.slice(0, cap);
+        } else if (!isAutoSpeak) {
+          aiMain = lastModel;
+        }
       }
+      const awaitingTtsStart =
+        isAutoSpeak &&
+        !cloneTtsPostSpeechHold &&
+        !isSpeaking &&
+        ttsStreaming &&
+        lastModelIdx >= 0;
+      return {
+        userMain: lastUser,
+        userAlt: '',
+        aiMain,
+        aiAlt: '',
+        waitingForModel,
+        lastUserImage,
+        awaitingTtsStart,
+      };
+    } catch (e) {
+      console.warn('[Clone caption state]', e);
+      return {
+        userMain: '',
+        userAlt: '',
+        aiMain: '',
+        aiAlt: '',
+        waitingForModel: false,
+        lastUserImage: undefined,
+        awaitingTtsStart: false,
+      };
     }
-    const awaitingTtsStart =
-      isAutoSpeak &&
-      !cloneTtsPostSpeechHold &&
-      !isSpeaking &&
-      ttsStreaming &&
-      lastModelIdx >= 0;
-    return {
-      userMain: lastUser,
-      userAlt: '',
-      aiMain,
-      aiAlt: '',
-      waitingForModel,
-      lastUserImage,
-      awaitingTtsStart,
-    };
   }, [
     conversationMode,
     activeSession?.messages,
@@ -2213,7 +2299,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
       const aiMessage: ChatMessage = {
         role: 'model',
-        text: extractModelReplyText(response, '...'),
+        text: String(extractModelReplyText(response, '…') ?? ''),
       };
 
       // update session again（主题生成另起异步，避免阻塞 isTyping → 顶部一直转圈）
@@ -2322,6 +2408,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       return false;
     }
     setCloneLiveCaptionUserLine('');
+    if (cloneDictationLateSendTimerRef.current != null) {
+      window.clearTimeout(cloneDictationLateSendTimerRef.current);
+      cloneDictationLateSendTimerRef.current = null;
+    }
     if (cloneDictationStopTimerRef.current != null) {
       window.clearTimeout(cloneDictationStopTimerRef.current);
       cloneDictationStopTimerRef.current = null;
@@ -2377,6 +2467,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         if (cloneDictationStopTimerRef.current != null) {
           window.clearTimeout(cloneDictationStopTimerRef.current);
           cloneDictationStopTimerRef.current = null;
+        }
+        if (cloneDictationLateSendTimerRef.current != null) {
+          window.clearTimeout(cloneDictationLateSendTimerRef.current);
+          cloneDictationLateSendTimerRef.current = null;
         }
         cloneHoldOutcomeRef.current = null;
         cloneAwaitingStopTapRef.current = false;
@@ -2466,14 +2560,40 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         const mid = cloneDictationAccumRef.current.trim();
         const tail = cloneDictationInterimRef.current.trim();
         const full = [mid, tail].filter((x) => x.length > 0).join(' ').trim();
-        cloneDictationAccumRef.current = '';
-        cloneDictationInterimRef.current = '';
 
         if (!full) {
+          if (oc === 'send') {
+            if (cloneDictationLateSendTimerRef.current != null) {
+              window.clearTimeout(cloneDictationLateSendTimerRef.current);
+            }
+            cloneDictationLateSendTimerRef.current = window.setTimeout(() => {
+              cloneDictationLateSendTimerRef.current = null;
+              flushCloneCaptionFromRefs();
+              const mid2 = cloneDictationAccumRef.current.trim();
+              const tail2 = cloneDictationInterimRef.current.trim();
+              const full2 = [mid2, tail2].filter((x) => x.length > 0).join(' ').trim();
+              cloneDictationAccumRef.current = '';
+              cloneDictationInterimRef.current = '';
+              if (full2) {
+                setInputText(cloneHoldSnapshotRef.current.trim());
+                armCloneUserDictationHoldAfterSend(full2);
+                setCloneLiveCaptionUserLine('');
+                sendMessageRef.current({ textOverride: full2, preserveInputFromVoiceHold: true });
+              } else {
+                setInputText(cloneHoldSnapshotRef.current.trim());
+                setCloneLiveCaptionUserLine('');
+              }
+            }, getCloneDictationLateTextCatchupMs());
+            return;
+          }
+          cloneDictationAccumRef.current = '';
+          cloneDictationInterimRef.current = '';
           setInputText(cloneHoldSnapshotRef.current.trim());
           setCloneLiveCaptionUserLine('');
           return;
         }
+        cloneDictationAccumRef.current = '';
+        cloneDictationInterimRef.current = '';
         setInputText(cloneHoldSnapshotRef.current.trim());
         armCloneUserDictationHoldAfterSend(full);
         setCloneLiveCaptionUserLine('');
@@ -3245,6 +3365,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
   const stopCloneDictation = useCallback(
     (opts?: { cleanup?: boolean }) => {
+      if (cloneDictationLateSendTimerRef.current != null) {
+        window.clearTimeout(cloneDictationLateSendTimerRef.current);
+        cloneDictationLateSendTimerRef.current = null;
+      }
       if (cloneDictationStopTimerRef.current != null) {
         window.clearTimeout(cloneDictationStopTimerRef.current);
         cloneDictationStopTimerRef.current = null;
@@ -3289,7 +3413,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       cloneDictationStopTimerRef.current = window.setTimeout(() => {
         cloneDictationStopTimerRef.current = null;
         stopCloneDictation();
-      }, 170);
+      }, getCloneDictationStopLeadMs());
       return;
     }
 
@@ -3624,6 +3748,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       if (cloneUserDictationHoldTimerRef.current != null) {
         window.clearTimeout(cloneUserDictationHoldTimerRef.current);
         cloneUserDictationHoldTimerRef.current = null;
+      }
+      if (cloneDictationLateSendTimerRef.current != null) {
+        window.clearTimeout(cloneDictationLateSendTimerRef.current);
+        cloneDictationLateSendTimerRef.current = null;
       }
       cloneHoldCleanupStopRef.current = true;
       try {
