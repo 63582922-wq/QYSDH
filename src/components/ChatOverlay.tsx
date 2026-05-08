@@ -628,6 +628,20 @@ function getCloneDictationLateTextCatchupMs(): number {
   return 280;
 }
 
+/**
+ * 手机常见竞态：SpeechRecognition 与第二条 getUserMedia（声纹 Analyser）同时占麦，识别结果长期为空或 onend 异常。
+ * 触摸/粗指针设备上跳过声纹麦克风流，仅保留 Web Speech（波形区无能量但可正常出字）。
+ */
+function shouldSkipCloneMicForSpeechDictation(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    if (window.matchMedia('(pointer: coarse)').matches) return true;
+  } catch {
+    /* ignore */
+  }
+  return 'ontouchstart' in window;
+}
+
 function sanitizeModelReplyText(text: string): string {
   let s = stripReasoningArtifacts(typeof text === 'string' ? text : String(text ?? ''));
   s = s.replace(/\u0000/g, '');
@@ -1122,7 +1136,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       window.clearTimeout(cloneUserDictationHoldTimerRef.current);
       cloneUserDictationHoldTimerRef.current = null;
     }
-    const t = spokenText.trim();
+    const t = typeof spokenText === 'string' ? spokenText.trim() : String(spokenText ?? '').trim();
     setCloneUserPostDictationHold(true);
     setCloneUserPostDictationEcho(t);
     cloneUserDictationHoldTimerRef.current = window.setTimeout(() => {
@@ -1221,17 +1235,23 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
    * 避免会话对象频繁换新引用时 effect 重复跑、或与正文偶然重复时键冲突，导致第二轮不复读。
    */
   const latestModelTurnMeta = useMemo(() => {
-    if (!activeSession?.messages?.length) return null;
-    for (let i = activeSession.messages.length - 1; i >= 0; i -= 1) {
-      const m = activeSession.messages[i];
-      if (m.role === 'model' && m.kind !== 'closing_note') {
-        return {
-          turnKey: `${activeSession.id}-model-${i}`,
-          text: safeMsgText(m.text),
-        };
+    try {
+      if (!activeSession?.messages?.length) return null;
+      for (let i = activeSession.messages.length - 1; i >= 0; i -= 1) {
+        const m = activeSession.messages[i];
+        if (!m) continue;
+        if (m.role === 'model' && m.kind !== 'closing_note') {
+          return {
+            turnKey: `${activeSession.id}-model-${i}`,
+            text: safeMsgText(m.text),
+          };
+        }
       }
+      return null;
+    } catch (e) {
+      console.warn('[latestModelTurnMeta]', e);
+      return null;
     }
-    return null;
   }, [activeSession?.id, activeSession?.messages]);
 
   const latestModelTurnKey = latestModelTurnMeta?.turnKey ?? '';
@@ -1916,7 +1936,12 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     let raf1 = 0;
     raf0 = window.requestAnimationFrame(() => {
       raf1 = window.requestAnimationFrame(() => {
-        el.scrollTop = el.scrollHeight;
+        try {
+          const sh = el.scrollHeight;
+          if (Number.isFinite(sh)) el.scrollTop = sh;
+        } catch (e) {
+          console.warn('[Clone caption scroll]', e);
+        }
       });
     });
     return () => {
@@ -2320,7 +2345,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         .map((m) => ({
           role: m.role,
           parts: [{ text: safeMsgText(m.text) }],
-        }));
+        }))
+        .filter((h) => (h.parts[0]?.text ?? '').trim().length > 0);
 
       const contents: any[] = [{ text: currentInput }];
       if (conversationMode === 'text_clone' || conversationMode === 'live') {
@@ -2496,7 +2522,10 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       return false;
     }
 
-    startCloneUserMicCapture();
+    stopCloneUserMicCapture();
+    if (!shouldSkipCloneMicForSpeechDictation()) {
+      startCloneUserMicCapture();
+    }
 
     const bindCloneDictationHandlers = (rec: SpeechRecognition, restartDepth: number) => {
       rec.lang = language === 'zh' ? 'zh-CN' : 'en-US';
