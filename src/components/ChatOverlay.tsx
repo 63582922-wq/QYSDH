@@ -810,7 +810,7 @@ function extractModelReplyText(response: unknown, fallback: string): string {
 /** 复刻：MediaRecorder 上传后由 Gemini 多模态转写（与对话主链路一致用 Flash） */
 const CLONE_TRANSCRIBE_MODEL = 'gemini-2.5-flash';
 const CLONE_MEDIA_RECORDER_SLICE_MS = 400;
-const MAX_CLONE_TRANSCRIBE_BYTES = 18 * 1024 * 1024;
+const MAX_CLONE_TRANSCRIBE_BYTES = 10 * 1024 * 1024;
 const CLONE_TRANSCRIBE_TIMEOUT_MS = 90_000;
 
 function pickMediaRecorderMimeType(): string | undefined {
@@ -827,6 +827,9 @@ function pickMediaRecorderMimeType(): string | undefined {
     } catch {
       /* ignore */
     }
+  }
+  if (import.meta.env.DEV) {
+    console.warn('[MediaRecorder] none of the preferred MIME types supported, falling back to browser default');
   }
   return undefined;
 }
@@ -883,6 +886,25 @@ async function transcribeCloneAudioWithGeminiFlash(opts: {
   } catch {
     return t.replace(/\u0000/g, '').trim();
   }
+}
+
+/** 等待 speechSynthesis.getVoices() 非空（部分浏览器首次返回 []，需等 voiceschanged） */
+function ensureVoicesLoaded(timeoutMs = 1500): Promise<SpeechSynthesisVoice[]> {
+  return new Promise((resolve) => {
+    if (typeof window.speechSynthesis === 'undefined') { resolve([]); return; }
+    const v = window.speechSynthesis.getVoices();
+    if (v.length > 0) { resolve(v); return; }
+    const timer = window.setTimeout(() => {
+      window.speechSynthesis.removeEventListener('voiceschanged', onReady);
+      resolve(window.speechSynthesis.getVoices());
+    }, timeoutMs);
+    const onReady = () => {
+      window.speechSynthesis.removeEventListener('voiceschanged', onReady);
+      clearTimeout(timer);
+      resolve(window.speechSynthesis.getVoices());
+    };
+    window.speechSynthesis.addEventListener('voiceschanged', onReady);
+  });
 }
 
 function formatProviderChatError(
@@ -1001,6 +1023,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const [cloneTtsRevealLen, setCloneTtsRevealLen] = useState(0);
   /** 本轮 TTS 正常结束后短暂保留全文 + 对话框，再收起 */
   const [cloneTtsPostSpeechHold, setCloneTtsPostSpeechHold] = useState(false);
+  /** audio.play() 因非用户手势抛 NotAllowedError 时，弹出"点击收听"按钮 */
+  const [cloneTtsNeedsUserGesture, setCloneTtsNeedsUserGesture] = useState(false);
+  const pendingUserGestureAudioRef = useRef<HTMLAudioElement | null>(null);
   const [showSavePreview, setShowSavePreview] = useState(false);
   /** 复刻镌刻：正在生成「留给你的话」结语 */
   const [etchAdviceBusy, setEtchAdviceBusy] = useState(false);
@@ -1034,6 +1059,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     }
   }, []);
   const [voiceBlockingMessage, setVoiceBlockingMessage] = useState<string | null>(null);
+  const voiceBlockingRetryRef = useRef<(() => void) | null>(null);
 
   /** 对话层关闭时收起所有 Portal 弹层，避免 isOpen 已 false 仍保留状态导致下一帧与 DOM 不一致（insertBefore 报错） */
   useEffect(() => {
@@ -1041,6 +1067,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     setShowHistoryModal(false);
     setShowSavePreview(false);
     setVoiceBlockingMessage(null);
+    voiceBlockingRetryRef.current = null;
   }, [isOpen]);
 
   /** 改 session 音色后强制重渲染（sessionStorage 本身不触发 React） */
@@ -1560,19 +1587,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   // 复刻：新 model 回合触发 MiniMax / 系统 TTS；Live 不走此链路。
   // 语音/TTS：必须用「最后一条 model 消息」的稳定 key，避免用户插话导致重复朗读。
   useEffect(() => {
-    let voicesListener: (() => void) | null = null;
-    let voicesFallbackId: number | null = null;
-
-    const cleanupSpeechVoicesWait = () => {
-      if (voicesListener) {
-        window.speechSynthesis.removeEventListener('voiceschanged', voicesListener);
-        voicesListener = null;
-      }
-      if (voicesFallbackId !== null) {
-        window.clearTimeout(voicesFallbackId);
-        voicesFallbackId = null;
-      }
-    };
 
     const stopMinimaxPlaybackVisual = () => {
       if (conversationModeRef.current === 'text_clone') {
@@ -1713,6 +1727,22 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 
       const bindSpeechSynthUtterance = (utterance: SpeechSynthesisUtterance) => {
         let synthStarted = false;
+        let revealTimerId: number | null = null;
+        let revealStartTime = 0;
+        /** onboundary 在安卓 Chrome 常不触发，用定时器兜底逐字显露 */
+        const startRevealTimer = () => {
+          const charsPerSec = 10 * utterance.rate;
+          revealStartTime = performance.now();
+          revealTimerId = window.setInterval(() => {
+            if (!isCurrentEpoch()) { clearRevealTimer(); return; }
+            const elapsed = (performance.now() - revealStartTime) / 1000;
+            const estimated = Math.floor(elapsed * charsPerSec);
+            setCloneTtsRevealLen((prev) => Math.max(prev, Math.min(speakSlice.length, estimated)));
+          }, 200);
+        };
+        const clearRevealTimer = () => {
+          if (revealTimerId !== null) { clearInterval(revealTimerId); revealTimerId = null; }
+        };
         utterance.onboundary = (ev) => {
           if (!synthStarted || !isCurrentEpoch()) return;
           const ci = ev.charIndex;
@@ -1720,15 +1750,18 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           if (typeof ci !== 'number' || !Number.isFinite(ci) || ci < 0) return;
           const end = ci + (typeof cl === 'number' && Number.isFinite(cl) ? cl : 0);
           if (!Number.isFinite(end)) return;
-          setCloneTtsRevealLen(Math.min(speakSlice.length, Math.max(0, end)));
+          // onboundary 到达时取 max，避免定时器估计值回退
+          setCloneTtsRevealLen((prev) => Math.min(speakSlice.length, Math.max(prev, Math.max(0, end))));
         };
         utterance.onstart = () => {
           if (!isCurrentEpoch()) return;
           synthStarted = true;
           runSpeechSynthPulse();
           setCloneTtsRevealLen((n) => Math.max(n, 1));
+          startRevealTimer();
         };
         utterance.onend = () => {
+          clearRevealTimer();
           if (!isCurrentEpoch()) return;
           if (speechSynthRafRef.current != null) {
             cancelAnimationFrame(speechSynthRafRef.current);
@@ -1738,6 +1771,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           scheduleCloneTtsDone({ postSpeechHoldMs: CLONE_TTS_POST_SPEECH_HOLD_MS });
         };
         utterance.onerror = (ev) => {
+          clearRevealTimer();
           /** 安卓 Chrome：cancel() 同步触发 onerror（error=canceled），旧回合应忽略 */
           if (!isCurrentEpoch()) return;
           const errMsg = (ev as SpeechSynthesisErrorEvent)?.error;
@@ -1751,11 +1785,11 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         };
       };
 
-      const applyVoiceAndSpeak = () => {
+      const applyVoiceAndSpeak = async () => {
         if (typeof window.speechSynthesis === 'undefined') return;
         try {
           const utterance = new SpeechSynthesisUtterance(speakSlice);
-          const voices = window.speechSynthesis.getVoices();
+          const voices = await ensureVoicesLoaded();
           const preferredVoice =
             voices.find((v) => (v.name.includes('Google') || v.name.includes('Premium')) && v.lang.includes('zh')) ||
             voices.find((v) => v.lang.includes('zh'));
@@ -1832,7 +1866,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
               const ACtor = window.AudioContext || (window as any).webkitAudioContext;
               if (ACtor) {
                 const tryCtx = new ACtor();
-                void tryCtx.resume();
+                try { await tryCtx.resume(); } catch { /* resume 失败，走直接播放 */ }
                 if (tryCtx.state === 'running') {
                   const src = tryCtx.createMediaElementSource(audio);
                   analyser = tryCtx.createAnalyser();
@@ -1843,7 +1877,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
                   minimaxAudioCtxRef.current = ctx;
                   liveAiVoiceAnalyserRef.current = analyser;
                 } else {
-                  tryCtx.close().catch(() => {});
+                  try { await tryCtx.close(); } catch { /* ignore */ }
                 }
               }
             } catch { /* AudioContext 不可用，直接播放 */ }
@@ -1878,24 +1912,17 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
               scheduleCloneTtsDone();
             };
             await audio.play();
-          } catch (e) {
+          } catch (e: any) {
             if (ac.signal.aborted) return;
+            // NotAllowedError: audio.play() 不在用户手势上下文（常见于部分移动浏览器）
+            if (e?.name === 'NotAllowedError' && minimaxAudioRef.current) {
+              pendingUserGestureAudioRef.current = minimaxAudioRef.current;
+              setCloneTtsNeedsUserGesture(true);
+              return;
+            }
             console.warn('MiniMax TTS failed, falling back to speechSynthesis', e);
             stopMinimaxPlayback();
-            const voices = window.speechSynthesis?.getVoices() ?? [];
-            if (voices.length === 0) {
-              voicesListener = () => {
-                cleanupSpeechVoicesWait();
-                applyVoiceAndSpeak();
-              };
-              window.speechSynthesis.addEventListener('voiceschanged', voicesListener);
-              voicesFallbackId = window.setTimeout(() => {
-                cleanupSpeechVoicesWait();
-                applyVoiceAndSpeak();
-              }, 600);
-            } else {
-              applyVoiceAndSpeak();
-            }
+            void applyVoiceAndSpeak();
           }
         })();
         return;
@@ -1905,27 +1932,15 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         scheduleCloneTtsDone();
         return;
       }
-      const voices = window.speechSynthesis.getVoices();
-      if (voices.length === 0) {
-        voicesListener = () => {
-          cleanupSpeechVoicesWait();
-          applyVoiceAndSpeak();
-        };
-        window.speechSynthesis.addEventListener('voiceschanged', voicesListener);
-        voicesFallbackId = window.setTimeout(() => {
-          cleanupSpeechVoicesWait();
-          applyVoiceAndSpeak();
-        }, 600);
-      } else {
-        applyVoiceAndSpeak();
-      }
+      void applyVoiceAndSpeak();
     };
 
     const cleanupFloatingAndTts = () => {
       clearFloatingDisplayTimers();
       clearCloneTtsHoldTimer();
       setCloneTtsPostSpeechHold(false);
-      cleanupSpeechVoicesWait();
+      setCloneTtsNeedsUserGesture(false);
+      pendingUserGestureAudioRef.current = null;
       window.speechSynthesis.cancel();
       minimaxSpeakAbortRef.current?.abort();
       minimaxSpeakAbortRef.current = null;
@@ -2511,22 +2526,43 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       lastChatErrorRef.current = error;
       setAiStatus('failed');
       setAiStatusText(formatGeminiUserMessage(error, language));
-      const errSessions = parseStoredSessions(localStorage.getItem('subconscious_sessions'));
-      let latestSessions = [...currentSessions];
-      let latestIndex = latestSessions.findIndex((s: ChatSession) => s.id === currentId);
-      if (latestIndex < 0 && errSessions.length > 0) {
-        latestSessions = errSessions;
-        latestIndex = latestSessions.findIndex((s: ChatSession) => s.id === currentId);
-      }
-      if (latestIndex >= 0) {
-        const errText = formatGeminiUserMessage(error, language);
-        const updatedSession = {
-          ...latestSessions[latestIndex],
-          messages: [...(latestSessions[latestIndex].messages || []), { role: 'model' as const, text: errText }],
-          updatedAt: Date.now(),
-        };
-        latestSessions[latestIndex] = updatedSession;
-        saveSessions(latestSessions);
+      const isTransient = isGeminiModelFallbackError(error);
+      if (isTransient) {
+        // 瞬时错误（503/429/超时）：不写入会话历史，弹对话框可重试
+        // 回滚已追加的 user message，避免重试时重复
+        const errSessions2 = parseStoredSessions(localStorage.getItem('subconscious_sessions'));
+        const idx2 = errSessions2.findIndex((s: ChatSession) => s.id === currentId);
+        if (idx2 >= 0 && errSessions2[idx2].messages?.length) {
+          const msgs = [...errSessions2[idx2].messages];
+          if (msgs[msgs.length - 1]?.role === 'user' && msgs[msgs.length - 1]?.text === effectiveUserText) {
+            msgs.pop();
+            errSessions2[idx2] = { ...errSessions2[idx2], messages: msgs, updatedAt: Date.now() };
+            saveSessions(errSessions2);
+          }
+        }
+        voiceBlockingRetryRef.current = () => void sendMessage({ textOverride: effectiveUserText });
+        setVoiceBlockingMessage(
+          formatGeminiUserMessage(error, language),
+        );
+      } else {
+        // 永久错误：保留原逻辑，写入会话历史
+        const errSessions = parseStoredSessions(localStorage.getItem('subconscious_sessions'));
+        let latestSessions = [...currentSessions];
+        let latestIndex = latestSessions.findIndex((s: ChatSession) => s.id === currentId);
+        if (latestIndex < 0 && errSessions.length > 0) {
+          latestSessions = errSessions;
+          latestIndex = latestSessions.findIndex((s: ChatSession) => s.id === currentId);
+        }
+        if (latestIndex >= 0) {
+          const errText = formatGeminiUserMessage(error, language);
+          const updatedSession = {
+            ...latestSessions[latestIndex],
+            messages: [...(latestSessions[latestIndex].messages || []), { role: 'model' as const, text: errText }],
+            updatedAt: Date.now(),
+          };
+          latestSessions[latestIndex] = updatedSession;
+          saveSessions(latestSessions);
+        }
       }
     } finally {
       setIsTyping(false);
@@ -2585,6 +2621,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
 
         const mime = pickMediaRecorderMimeType();
         const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        if (import.meta.env.DEV) console.info('[MediaRecorder] actual mimeType:', rec.mimeType);
         cloneRecordChunksRef.current = [];
         rec.ondataavailable = (ev) => {
           if (ev.data.size > 0) cloneRecordChunksRef.current.push(ev.data);
@@ -2626,39 +2663,64 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
           }
 
           setCloneLiveCaptionUserLine(language === 'zh' ? '正在识别…' : 'Transcribing…');
+          const MAX_TRANSCRIBE_RETRIES = 2;
+          let lastError: unknown = null;
           try {
-            const text = await transcribeCloneAudioWithGeminiFlash({ blob, language });
-            if (epoch !== cloneDictationEpochRef.current || conversationModeRef.current !== 'text_clone') {
+            for (let attempt = 0; attempt <= MAX_TRANSCRIBE_RETRIES; attempt++) {
+              if (epoch !== cloneDictationEpochRef.current || conversationModeRef.current !== 'text_clone') {
+                setCloneLiveCaptionUserLine('');
+                setIsCloneDictating(false);
+                return;
+              }
+              try {
+                const text = await transcribeCloneAudioWithGeminiFlash({ blob, language });
+                if (epoch !== cloneDictationEpochRef.current || conversationModeRef.current !== 'text_clone') {
+                  setCloneLiveCaptionUserLine('');
+                  setIsCloneDictating(false);
+                  return;
+                }
+                const full = text.trim();
+                setCloneLiveCaptionUserLine('');
+                if (!full) {
+                  setInputText(cloneHoldSnapshotRef.current.trim());
+                  setVoiceBlockingMessage(
+                    language === 'zh' ? '未识别到语音内容，请再试一次。' : 'No speech detected. Try again.',
+                  );
+                  setIsCloneDictating(false);
+                  return;
+                }
+                setInputText(cloneHoldSnapshotRef.current.trim());
+                armCloneUserDictationHoldAfterSend(full);
+                sendMessageRef.current({ textOverride: full, preserveInputFromVoiceHold: true });
+                lastError = null;
+                break;
+              } catch (e) {
+                lastError = e;
+                const errMsg = String((e as Error)?.message ?? e ?? '');
+                if (errMsg === 'CLONE_AUDIO_TOO_LARGE') break;
+                if (attempt < MAX_TRANSCRIBE_RETRIES) {
+                  console.warn(`[Clone transcribe] attempt ${attempt + 1} failed, retrying…`, e);
+                  setCloneLiveCaptionUserLine(
+                    language === 'zh' ? `识别失败，重试中(${attempt + 1})…` : `Failed, retrying (${attempt + 1})…`,
+                  );
+                  await new Promise<void>((r) => setTimeout(r, 1000 * (attempt + 1)));
+                }
+              }
+            }
+            if (lastError) {
+              console.warn('[Clone transcribe] all retries exhausted', lastError);
               setCloneLiveCaptionUserLine('');
-              setIsCloneDictating(false);
-              return;
-            }
-            const full = text.trim();
-            setCloneLiveCaptionUserLine('');
-            if (!full) {
               setInputText(cloneHoldSnapshotRef.current.trim());
-              setVoiceBlockingMessage(
-                language === 'zh' ? '未识别到语音内容，请再试一次。' : 'No speech detected. Try again.',
-              );
-              setIsCloneDictating(false);
-              return;
-            }
-            setInputText(cloneHoldSnapshotRef.current.trim());
-            armCloneUserDictationHoldAfterSend(full);
-            sendMessageRef.current({ textOverride: full, preserveInputFromVoiceHold: true });
-          } catch (e) {
-            console.warn('[Clone transcribe]', e);
-            setCloneLiveCaptionUserLine('');
-            setInputText(cloneHoldSnapshotRef.current.trim());
-            const msg = String((e as Error)?.message ?? e ?? '');
-            if (msg === 'CLONE_AUDIO_TOO_LARGE') {
-              setVoiceBlockingMessage(
-                language === 'zh' ? '录音过长，请分段录制。' : 'Recording too long. Try a shorter clip.',
-              );
-            } else {
-              setVoiceBlockingMessage(
-                language === 'zh' ? '语音转写出错，请改用键盘输入或稍后重试。' : 'Transcription failed. Type or try again later.',
-              );
+              const msg = String((lastError as Error)?.message ?? lastError ?? '');
+              if (msg === 'CLONE_AUDIO_TOO_LARGE') {
+                setVoiceBlockingMessage(
+                  language === 'zh' ? '录音过长，请分段录制。' : 'Recording too long. Try a shorter clip.',
+                );
+              } else {
+                setVoiceBlockingMessage(
+                  language === 'zh' ? '语音转写出错，请改用键盘输入或稍后重试。' : 'Transcription failed. Type or try again later.',
+                );
+              }
             }
           } finally {
             setIsCloneDictating(false);
@@ -4220,7 +4282,11 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                       ) : null}
                       <div className="flex min-h-0 flex-1 flex-col justify-center overflow-hidden px-2.5 py-2 text-right">
                         {cloneUserSubtitleDisplay ? (
-                          <p className="line-clamp-6 break-words text-[11px] leading-snug text-zinc-200/95 not-italic md:text-[12px]">
+                          <p className={`line-clamp-6 break-words text-[11px] leading-snug text-zinc-200/95 not-italic md:text-[12px] ${
+                            cloneUserSubtitleDisplay.includes('识别') || cloneUserSubtitleDisplay.includes('Transcribing') || cloneUserSubtitleDisplay.includes('Retrying') || cloneUserSubtitleDisplay.includes('重试')
+                              ? 'animate-pulse'
+                              : ''
+                          }`}>
                             {cloneUserSubtitleDisplay}
                           </p>
                         ) : isCloneDictating ? (
@@ -4273,6 +4339,21 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                           <p className="break-words font-serif text-[12px] italic leading-relaxed tracking-normal text-zinc-50/95 md:text-[13px]">
                             {cloneAiCaptionMain}
                           </p>
+                        ) : cloneTtsNeedsUserGesture ? (
+                          <button
+                            type="button"
+                            className="inline-flex items-center gap-1.5 rounded-full border border-rose-500/40 bg-rose-950/50 px-4 py-1.5 font-serif text-[11px] italic text-rose-200/90 transition-colors active:bg-rose-900/60"
+                            onClick={() => {
+                              const a = pendingUserGestureAudioRef.current;
+                              if (a) {
+                                pendingUserGestureAudioRef.current = null;
+                                setCloneTtsNeedsUserGesture(false);
+                                a.play().catch(() => {});
+                              }
+                            }}
+                          >
+                            {language === 'zh' ? '点击收听' : 'Tap to listen'}
+                          </button>
                         ) : cloneAwaitingTtsStart ? (
                           <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
                             {language === 'zh' ? '正在接通回响…' : 'Preparing voice…'}
@@ -4735,13 +4816,29 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
             className="max-h-[min(70dvh,26rem)] w-full max-w-sm overflow-y-auto rounded-2xl border border-zinc-700/80 bg-zinc-950 px-5 py-6 shadow-2xl"
           >
             <p className="text-left text-[14px] leading-relaxed text-zinc-300">{voiceBlockingMessage}</p>
-            <button
-              type="button"
-              className="mt-6 min-h-[44px] w-full rounded-xl border border-zinc-600 bg-zinc-900 py-3 text-sm font-medium text-zinc-100 touch-manipulation active:bg-zinc-800"
-              onClick={() => setVoiceBlockingMessage(null)}
-            >
-              {language === 'zh' ? '确定' : 'OK'}
-            </button>
+            <div className="mt-6 flex flex-col gap-2">
+              {voiceBlockingRetryRef.current ? (
+                <button
+                  type="button"
+                  className="min-h-[44px] w-full rounded-xl border border-rose-600/60 bg-rose-950/60 py-3 text-sm font-medium text-rose-100 touch-manipulation active:bg-rose-900/60"
+                  onClick={() => {
+                    const fn = voiceBlockingRetryRef.current;
+                    voiceBlockingRetryRef.current = null;
+                    setVoiceBlockingMessage(null);
+                    fn?.();
+                  }}
+                >
+                  {language === 'zh' ? '重试' : 'Retry'}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="min-h-[44px] w-full rounded-xl border border-zinc-600 bg-zinc-900 py-3 text-sm font-medium text-zinc-100 touch-manipulation active:bg-zinc-800"
+                onClick={() => { voiceBlockingRetryRef.current = null; setVoiceBlockingMessage(null); }}
+              >
+                {language === 'zh' ? '确定' : 'OK'}
+              </button>
+            </div>
           </div>
         </div>,
         getAppPortalNode(),
