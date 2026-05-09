@@ -4177,116 +4177,61 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
              ) : null}
              </div>
            )}
-          {conversationMode === 'text_clone' && showCloneCaptionChrome ? (
+          {conversationMode === 'text_clone' && showCloneAiCaptionPanel ? (
                 <div
-                  className="pointer-events-auto mb-1.5 flex w-full min-h-0 flex-col gap-2 font-serif italic"
+                  className="pointer-events-auto mb-1.5 w-full font-serif italic"
                   aria-live="polite"
                   aria-relevant="additions text"
                 >
-                  {showCloneUserCaptionPanel ? (
-                    <div
-                      className={`animate-in fade-in slide-in-from-bottom-1 flex flex-col overflow-hidden rounded-xl border border-zinc-800/90 bg-zinc-950/90 shadow-inner backdrop-blur-md duration-300 ${
-                        isCloneDictating ? 'min-h-[5.25rem] md:min-h-[6rem]' : 'min-h-[4.5rem] md:min-h-[5.25rem]'
-                      }`}
-                    >
-                      <div className="shrink-0 border-b border-zinc-800/60 px-2.5 py-1 text-[9px] font-medium uppercase tracking-wider text-zinc-500 not-italic">
-                        {language === 'zh' ? '我说' : 'You'}
-                      </div>
-                      {isCloneDictating ? (
-                        <div className="shrink-0 px-2 pb-1 pt-1" aria-hidden>
-                          <canvas
-                            ref={voiceprintCanvasRef}
-                            className="mx-auto block h-[52px] w-full max-w-full rounded-md bg-black ring-1 ring-cyan-950/40"
-                            width={VOICEPRINT_CANVAS_W}
-                            height={VOICEPRINT_CANVAS_H}
-                          />
-                        </div>
+                  <div
+                    className="animate-in fade-in slide-in-from-bottom-1 flex min-h-[3rem] max-h-[min(52vh,22rem)] flex-col overflow-hidden rounded-xl border border-zinc-800/90 bg-zinc-950/90 shadow-inner backdrop-blur-md duration-300"
+                  >
+                    <div className="shrink-0 border-b border-zinc-800/60 px-2.5 py-1 text-[9px] font-medium uppercase tracking-wider text-zinc-500 not-italic">
+                      <span className="line-clamp-1 normal-case tracking-normal">{aiDisplayName}</span>
+                      {isTyping && cloneWaitingForModel ? (
+                        <span className="ml-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-zinc-500 align-middle" />
+                      ) : isSpeaking || cloneAwaitingTtsStart ? (
+                        <span className="ml-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400/70 align-middle" />
                       ) : null}
-                      <div className="flex min-h-0 flex-1 flex-col justify-center overflow-hidden px-2.5 py-2 text-right">
-                        {cloneUserSubtitleDisplay ? (
-                          <p className={`line-clamp-6 break-words text-[11px] leading-snug text-zinc-200/95 not-italic md:text-[12px] ${
-                            cloneUserSubtitleDisplay.includes('识别') || cloneUserSubtitleDisplay.includes('Transcribing') || cloneUserSubtitleDisplay.includes('Retrying') || cloneUserSubtitleDisplay.includes('重试')
-                              ? 'animate-pulse'
-                              : ''
-                          }`}>
-                            {cloneUserSubtitleDisplay}
-                          </p>
-                        ) : isCloneDictating ? (
-                          <p className="text-[10px] text-zinc-600 not-italic md:text-[11px]">
-                            {language === 'zh' ? '再点一下麦克风完成并发送' : 'Tap the mic again to finish and send'}
-                          </p>
-                        ) : null}
-                        {cloneUserCaptionAlt ? (
-                          <p className="mt-1 line-clamp-3 break-words text-[10px] leading-snug text-zinc-500 not-italic md:text-[11px]">
-                            {cloneUserCaptionAlt}
-                          </p>
-                        ) : null}
-                      </div>
                     </div>
-                  ) : null}
-                  {showCloneAiCaptionPanel ? (
                     <div
-                      className={`animate-in fade-in slide-in-from-bottom-1 flex min-h-[5rem] max-h-[min(52vh,22rem)] flex-col overflow-hidden rounded-xl border bg-zinc-950/90 shadow-inner backdrop-blur-md duration-300 md:min-h-[5.75rem] ${
-                        isSpeaking || cloneAwaitingTtsStart
-                          ? 'border-rose-500/35 shadow-[0_0_20px_rgba(244,63,94,0.08)]'
-                          : 'border-zinc-800/90'
-                      }`}
+                      ref={cloneAiCaptionScrollRef}
+                      className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-2.5 py-2 text-left [overflow-anchor:none]"
                     >
-                      {isSpeaking || cloneAwaitingTtsStart ? (
-                        <div
-                          className="relative flex h-5 w-full shrink-0 justify-center motion-reduce:hidden"
-                          aria-hidden
+                      {cloneAiCaptionMain ? (
+                        <p className="break-words font-serif text-[12px] italic leading-relaxed tracking-normal text-zinc-50/95 md:text-[13px]">
+                          {cloneAiCaptionMain}
+                        </p>
+                      ) : cloneTtsNeedsUserGesture ? (
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-1.5 rounded-full border border-rose-500/40 bg-rose-950/50 px-4 py-1.5 font-serif text-[11px] italic text-rose-200/90 transition-colors active:bg-rose-900/60"
+                          onClick={() => {
+                            const a = pendingUserGestureAudioRef.current;
+                            if (a) {
+                              pendingUserGestureAudioRef.current = null;
+                              setCloneTtsNeedsUserGesture(false);
+                              a.play().catch(() => {});
+                            }
+                          }}
                         >
-                          <span className="pointer-events-none absolute top-1/2 h-9 w-9 -translate-y-1/2 rounded-full border border-rose-400/25 animate-ping" />
-                        </div>
+                          {language === 'zh' ? '点击收听' : 'Tap to listen'}
+                        </button>
+                      ) : cloneAwaitingTtsStart ? (
+                        <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
+                          {language === 'zh' ? '正在接通回响…' : 'Preparing voice…'}
+                        </p>
+                      ) : isSpeaking ? (
+                        <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
+                          …
+                        </p>
+                      ) : isTyping && cloneWaitingForModel ? (
+                        <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
+                          {language === 'zh' ? '等待回响…' : 'Waiting…'}
+                        </p>
                       ) : null}
-                      <div className="shrink-0 border-b border-zinc-800/60 px-2.5 py-1 text-[9px] font-medium uppercase tracking-wider text-zinc-500 not-italic">
-                        <span className="line-clamp-1 normal-case tracking-normal">{aiDisplayName}</span>
-                      </div>
-                      <div
-                        ref={cloneAiCaptionScrollRef}
-                        className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-2.5 py-2 text-left [overflow-anchor:none]"
-                      >
-                        {cloneAiCaptionMain ? (
-                          <p className="break-words font-serif text-[12px] italic leading-relaxed tracking-normal text-zinc-50/95 md:text-[13px]">
-                            {cloneAiCaptionMain}
-                          </p>
-                        ) : cloneTtsNeedsUserGesture ? (
-                          <button
-                            type="button"
-                            className="inline-flex items-center gap-1.5 rounded-full border border-rose-500/40 bg-rose-950/50 px-4 py-1.5 font-serif text-[11px] italic text-rose-200/90 transition-colors active:bg-rose-900/60"
-                            onClick={() => {
-                              const a = pendingUserGestureAudioRef.current;
-                              if (a) {
-                                pendingUserGestureAudioRef.current = null;
-                                setCloneTtsNeedsUserGesture(false);
-                                a.play().catch(() => {});
-                              }
-                            }}
-                          >
-                            {language === 'zh' ? '点击收听' : 'Tap to listen'}
-                          </button>
-                        ) : cloneAwaitingTtsStart ? (
-                          <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
-                            {language === 'zh' ? '正在接通回响…' : 'Preparing voice…'}
-                          </p>
-                        ) : isSpeaking ? (
-                          <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
-                            …
-                          </p>
-                        ) : isTyping && cloneWaitingForModel ? (
-                          <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
-                            {language === 'zh' ? '等待回响…' : 'Waiting…'}
-                          </p>
-                        ) : null}
-                        {cloneAiCaptionAlt ? (
-                          <p className="mt-1 line-clamp-3 break-words font-serif text-[11px] italic leading-relaxed tracking-normal text-zinc-400 md:text-[12px]">
-                            {cloneAiCaptionAlt}
-                          </p>
-                        ) : null}
-                      </div>
                     </div>
-                  ) : null}
+                  </div>
                 </div>
           ) : null}
           {allowLiveVoice ? (
