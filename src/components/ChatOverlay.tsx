@@ -1040,6 +1040,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const minimaxObjectUrlRef = useRef<string | null>(null);
   /** MiniMax：真正 onplay 之后才按进度显露字幕，避免 duration/解码前误算成满屏字 */
   const minimaxRevealPlaybackStartedRef = useRef(false);
+  const minimaxRevealIntervalRef = useRef<number | null>(null);
   /** 播完后延迟清空 playback 状态 */
   const cloneTtsHoldTimerRef = useRef<number | null>(null);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
@@ -1800,6 +1801,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 
             const teardownMinimaxAudioSurface = () => {
               stopMinimaxPlaybackVisual();
+              if (minimaxRevealIntervalRef.current != null) { clearInterval(minimaxRevealIntervalRef.current); minimaxRevealIntervalRef.current = null; }
               onSpeechValueRef.current?.(0);
               minimaxRevealPlaybackStartedRef.current = false;
               if (minimaxObjectUrlRef.current) {
@@ -1817,24 +1819,26 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
               console.info(`[TTS] MiniMax onplay epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
               minimaxRevealPlaybackStartedRef.current = true;
               setCloneTtsRevealLen((n) => Math.max(n, 1));
-            };
-            audio.ontimeupdate = () => {
-              if (!isCurrentEpoch() || !minimaxRevealPlaybackStartedRef.current) return;
-              const d = audio.duration;
-              const ct = audio.currentTime;
-              if (Number.isFinite(d) && d > 0.05 && Number.isFinite(ct)) {
-                const ratio = Math.min(1, ct / d);
-                const n = Math.max(0, Math.ceil(speakSlice.length * ratio));
-                if (Number.isFinite(n) && n > 0) setCloneTtsRevealLen(n);
-              }
+              minimaxRevealIntervalRef.current = window.setInterval(() => {
+                if (!isCurrentEpoch() || !minimaxRevealPlaybackStartedRef.current) return;
+                const d = audio.duration;
+                const ct = audio.currentTime;
+                if (Number.isFinite(d) && d > 0.05 && Number.isFinite(ct)) {
+                  const ratio = Math.min(1, ct / d);
+                  const n = Math.max(0, Math.ceil(speakSlice.length * ratio));
+                  if (Number.isFinite(n) && n > 0) setCloneTtsRevealLen(n);
+                }
+              }, 80);
             };
             audio.onended = () => {
               console.info(`[TTS] MiniMax onended epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
+              if (minimaxRevealIntervalRef.current != null) { clearInterval(minimaxRevealIntervalRef.current); minimaxRevealIntervalRef.current = null; }
               teardownMinimaxAudioSurface();
               scheduleCloneTtsDone({ postSpeechHoldMs: CLONE_TTS_POST_SPEECH_HOLD_MS });
             };
             audio.onerror = () => {
               console.info(`[TTS] MiniMax audio.onerror epoch=${messageKey} renderPhase=${isRenderingRef.current}`);
+              if (minimaxRevealIntervalRef.current != null) { clearInterval(minimaxRevealIntervalRef.current); minimaxRevealIntervalRef.current = null; }
               teardownMinimaxAudioSurface();
               scheduleCloneTtsDone();
             };
