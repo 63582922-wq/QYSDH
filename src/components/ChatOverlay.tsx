@@ -1026,9 +1026,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const [cloneTtsRevealLen, setCloneTtsRevealLen] = useState(0);
   /** 本轮 TTS 正常结束后短暂保留全文 + 对话框，再收起 */
   const [cloneTtsPostSpeechHold, setCloneTtsPostSpeechHold] = useState(false);
-  /** audio.play() 因非用户手势抛 NotAllowedError 时，弹出"点击收听"按钮 */
-  const [cloneTtsNeedsUserGesture, setCloneTtsNeedsUserGesture] = useState(false);
-  const pendingUserGestureAudioRef = useRef<HTMLAudioElement | null>(null);
   const [showSavePreview, setShowSavePreview] = useState(false);
   /** 复刻镌刻：正在生成「留给你的话」结语 */
   const [etchAdviceBusy, setEtchAdviceBusy] = useState(false);
@@ -1858,12 +1855,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             await audio.play();
           } catch (e: any) {
             if (ac.signal.aborted) return;
-            // NotAllowedError: audio.play() 不在用户手势上下文（常见于部分移动浏览器）
-            if (e?.name === 'NotAllowedError' && minimaxAudioRef.current) {
-              pendingUserGestureAudioRef.current = minimaxAudioRef.current;
-              setCloneTtsNeedsUserGesture(true);
-              return;
-            }
             console.warn('MiniMax TTS failed, falling back to speechSynthesis', e);
             stopMinimaxPlayback();
             void applyVoiceAndSpeak();
@@ -1884,12 +1875,11 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       clearFloatingDisplayTimers();
       clearCloneTtsHoldTimer();
       setCloneTtsPostSpeechHold(false);
-      setCloneTtsNeedsUserGesture(false);
-      pendingUserGestureAudioRef.current = null;
+      // 先清 epoch，再 cancel，避免 cancel 同步触发 onerror 时 isCurrentEpoch() 仍为 true → setState → 崩溃
+      lastSpokenMessageIdRef.current = '';
       window.speechSynthesis.cancel();
       minimaxSpeakAbortRef.current?.abort();
       minimaxSpeakAbortRef.current = null;
-      lastSpokenMessageIdRef.current = '';
       stopMinimaxPlaybackVisual();
       if (minimaxAudioRef.current) {
         try {
@@ -4236,21 +4226,6 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                         <p className="break-words font-serif text-[12px] italic leading-relaxed tracking-normal text-zinc-50/95 md:text-[13px]">
                           {cloneAiCaptionMain}
                         </p>
-                      ) : cloneTtsNeedsUserGesture ? (
-                        <button
-                          type="button"
-                          className="inline-flex items-center gap-1.5 rounded-full border border-rose-500/40 bg-rose-950/50 px-4 py-1.5 font-serif text-[11px] italic text-rose-200/90 transition-colors active:bg-rose-900/60"
-                          onClick={() => {
-                            const a = pendingUserGestureAudioRef.current;
-                            if (a) {
-                              pendingUserGestureAudioRef.current = null;
-                              setCloneTtsNeedsUserGesture(false);
-                              a.play().catch(() => {});
-                            }
-                          }}
-                        >
-                          {language === 'zh' ? '点击收听' : 'Tap to listen'}
-                        </button>
                       ) : cloneAwaitingTtsStart ? (
                         <p className="font-serif text-[12px] italic text-zinc-500 md:text-[13px]">
                           {language === 'zh' ? '正在接通回响…' : 'Preparing voice…'}
