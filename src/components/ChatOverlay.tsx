@@ -361,8 +361,8 @@ const MAX_REPLY_CHARS = 8000;
 const MAX_TTS_CHARS = 4000;
 /** 复刻自动朗读结束后，字幕对话框再停留时长（约 1～2 秒） */
 const CLONE_TTS_POST_SPEECH_HOLD_MS = 1600;
-/** 复刻语音输入完成发送后，「我说」卡片再停留约两秒再收起（仅保留此框内文字，不再在上方重复气泡） */
-const CLONE_USER_POST_DICTATION_HOLD_MS = 2000;
+/** 复刻语音输入完成后，识别文字持续显示直到 AI 开始说话 */
+const CLONE_USER_POST_DICTATION_HOLD_MS = 30_000;
 
 /** Live 回复 PCM 播放略放慢，减轻「赶」的感觉（略降音高，一般可接受） */
 const LIVE_AUDIO_PLAYBACK_RATE = 0.9;
@@ -1364,9 +1364,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       if (lastModelIdx >= 0) {
         if (cloneTtsPostSpeechHold) {
           aiMain = lastModel;
-        } else if (ttsStreaming && cloneTtsRevealLen > 0) {
+        } else if (ttsStreaming) {
           aiMain = lastModel.slice(0, Math.min(lastModel.length, cloneTtsRevealLen));
-        } else {
+        } else if (!isAutoSpeak) {
           aiMain = lastModel;
         }
       }
@@ -1412,10 +1412,10 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneAiCaptionAlt = cloneCaptionState?.aiAlt ?? '';
   const cloneWaitingForModel = cloneCaptionState?.waitingForModel ?? false;
   const cloneAwaitingTtsStart = cloneCaptionState?.awaitingTtsStart ?? false;
-  /** 复刻：听写中显示实时状态，识别完显示文字，AI 回复后隐藏 */
+  /** 复刻：听写中显示实时状态，识别完显示文字，AI 开始说话后隐藏 */
   const cloneUserSubtitleDisplay = isCloneDictating
     ? cloneLiveCaptionUserLine.trim()
-    : cloneUserPostDictationHold && cloneUserPostDictationEcho.trim()
+    : (cloneUserPostDictationHold || isTyping) && cloneUserPostDictationEcho.trim()
       ? cloneUserPostDictationEcho.trim()
       : '';
 
@@ -1817,6 +1817,16 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
               console.info(`[TTS] MiniMax onplay epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
               minimaxRevealPlaybackStartedRef.current = true;
               setCloneTtsRevealLen((n) => Math.max(n, 1));
+            };
+            audio.ontimeupdate = () => {
+              if (!isCurrentEpoch() || !minimaxRevealPlaybackStartedRef.current) return;
+              const d = audio.duration;
+              const ct = audio.currentTime;
+              if (Number.isFinite(d) && d > 0.05 && Number.isFinite(ct)) {
+                const ratio = Math.min(1, ct / d);
+                const n = Math.max(0, Math.ceil(speakSlice.length * ratio));
+                if (Number.isFinite(n) && n > 0) setCloneTtsRevealLen(n);
+              }
             };
             audio.onended = () => {
               console.info(`[TTS] MiniMax onended epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
