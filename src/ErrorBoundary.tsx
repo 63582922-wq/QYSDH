@@ -6,6 +6,7 @@ interface Props {
 
 interface State {
   hasError: boolean;
+  error: Error | null;
 }
 
 const ERROR_LOG_KEY = 'subconscious_last_render_error';
@@ -13,10 +14,10 @@ const ERROR_LOG_KEY = 'subconscious_last_render_error';
 /** 防止单次渲染抛错导致整页黑屏 / 白屏（常见于移动端 WebView） */
 export class ErrorBoundary extends Component<Props, State> {
   declare readonly props: Readonly<Props>;
-  state: State = { hasError: false };
+  state: State = { hasError: false, error: null };
 
-  static getDerivedStateFromError(): State {
-    return { hasError: true };
+  static getDerivedStateFromError(error: Error): State {
+    return { hasError: true, error };
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
@@ -33,14 +34,20 @@ export class ErrorBoundary extends Component<Props, State> {
 
   render() {
     if (this.state.hasError) {
+      const errMsg = this.state.error?.message ?? '';
       return (
         <div
           className="flex min-h-dvh flex-col items-center justify-center gap-6 bg-[#050505] px-6 text-center text-zinc-300"
           style={{ fontFamily: 'system-ui, sans-serif' }}
         >
           <p className="max-w-sm text-sm leading-relaxed text-zinc-400">
-            页面渲染出错（常见于内存不足或浏览器兼容性）。请点击下方重试。
+            页面渲染出错。请点击下方重试。
           </p>
+          {errMsg ? (
+            <p className="max-w-sm break-all text-[11px] leading-relaxed text-zinc-600">
+              {errMsg.slice(0, 300)}
+            </p>
+          ) : null}
           <button
             type="button"
             className="rounded-full border border-zinc-700 bg-zinc-900 px-8 py-3 text-xs uppercase tracking-widest text-zinc-300 active:bg-zinc-800"

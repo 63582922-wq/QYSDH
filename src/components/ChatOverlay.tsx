@@ -995,12 +995,15 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
    * - **复刻**（`conversationMode === 'text_clone'`）：Gemini 文本多轮（咨询师提示）+ 可选复刻音色 TTS；界面与 Live 一致（状态条 +「我说 / AI」字幕面板），不保留会话气泡列表。
    */
   type AIStatus = 'connected' | 'failed';
+  const isRenderingRef = useRef(false);
+  isRenderingRef.current = true;
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [inputText, setInputText] = useState('');
   const inputTextRef = useRef('');
+  useEffect(() => { isRenderingRef.current = false; });
   useEffect(() => {
     inputTextRef.current = inputText;
   }, [inputText]);
@@ -1666,6 +1669,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     };
 
     const scheduleCloneTtsDone = (opts?: { postSpeechHoldMs?: number }) => {
+      console.info(`[TTS] scheduleCloneTtsDone epoch=${lastSpokenMessageIdRef.current} holdMs=${opts?.postSpeechHoldMs ?? 0} renderPhase=${isRenderingRef.current}`);
       clearFloatingDisplayTimers();
       clearCloneTtsHoldTimer();
       const holdMs = opts?.postSpeechHoldMs ?? 0;
@@ -1694,6 +1698,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         setCloneTtsPlaybackMsgIdx(idxFromKey);
         setCloneTtsRevealLen(0);
       }
+      console.info(`[TTS] speakCloneReadAloud START epoch=${messageKey} prevEpoch=${lastSpokenMessageIdRef.current}`);
       lastSpokenMessageIdRef.current = messageId;
       setIsSpeaking(true);
 
@@ -1705,7 +1710,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
        */
       const isCurrentEpoch = (): boolean => lastSpokenMessageIdRef.current === messageId;
 
+      console.info(`[TTS] calling speechSynthesis.cancel(), current synth.speaking=${window.speechSynthesis?.speaking}`);
       try { window.speechSynthesis.cancel(); } catch { /* ignore */ }
+      console.info(`[TTS] speechSynthesis.cancel() returned`);
       stopMinimaxPlayback();
 
       const speakSlice = text.length > MAX_TTS_CHARS ? `${text.slice(0, MAX_TTS_CHARS)}…` : text;
@@ -1754,6 +1761,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           setCloneTtsRevealLen((prev) => Math.min(speakSlice.length, Math.max(prev, Math.max(0, end))));
         };
         utterance.onstart = () => {
+          console.info(`[TTS] onstart epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
           if (!isCurrentEpoch()) return;
           synthStarted = true;
           runSpeechSynthPulse();
@@ -1762,6 +1770,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         };
         utterance.onend = () => {
           clearRevealTimer();
+          console.info(`[TTS] onend epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
           if (!isCurrentEpoch()) return;
           if (speechSynthRafRef.current != null) {
             cancelAnimationFrame(speechSynthRafRef.current);
@@ -1772,9 +1781,10 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         };
         utterance.onerror = (ev) => {
           clearRevealTimer();
+          const errMsg = (ev as SpeechSynthesisErrorEvent)?.error;
+          console.info(`[TTS] onerror epoch=${messageKey} isCurrent=${isCurrentEpoch()} err=${errMsg} renderPhase=${isRenderingRef.current}`);
           /** 安卓 Chrome：cancel() 同步触发 onerror（error=canceled），旧回合应忽略 */
           if (!isCurrentEpoch()) return;
-          const errMsg = (ev as SpeechSynthesisErrorEvent)?.error;
           if (errMsg === 'canceled' || errMsg === 'interrupted') return;
           if (speechSynthRafRef.current != null) {
             cancelAnimationFrame(speechSynthRafRef.current);
@@ -1898,19 +1908,23 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             };
 
             audio.onplay = () => {
+              console.info(`[TTS] MiniMax onplay epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
               if (ctx) void ctx.resume();
               minimaxRevealPlaybackStartedRef.current = true;
               setCloneTtsRevealLen((n) => Math.max(n, 1));
               if (analyser) startMinimaxAnalyserLoop(audio, analyser);
             };
             audio.onended = () => {
+              console.info(`[TTS] MiniMax onended epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
               teardownMinimaxAudioSurface();
               scheduleCloneTtsDone({ postSpeechHoldMs: CLONE_TTS_POST_SPEECH_HOLD_MS });
             };
             audio.onerror = () => {
+              console.info(`[TTS] MiniMax audio.onerror epoch=${messageKey} renderPhase=${isRenderingRef.current}`);
               teardownMinimaxAudioSurface();
               scheduleCloneTtsDone();
             };
+            console.info(`[TTS] MiniMax calling audio.play() epoch=${messageKey} renderPhase=${isRenderingRef.current}`);
             await audio.play();
           } catch (e: any) {
             if (ac.signal.aborted) return;
@@ -1936,6 +1950,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     };
 
     const cleanupFloatingAndTts = () => {
+      console.info(`[TTS] cleanupFloatingAndTts epoch=${lastSpokenMessageIdRef.current} renderPhase=${isRenderingRef.current}`);
       clearFloatingDisplayTimers();
       clearCloneTtsHoldTimer();
       setCloneTtsPostSpeechHold(false);
