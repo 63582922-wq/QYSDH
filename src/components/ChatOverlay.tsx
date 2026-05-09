@@ -1038,13 +1038,10 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const minimaxSpeakAbortRef = useRef<AbortController | null>(null);
   const minimaxAudioRef = useRef<HTMLAudioElement | null>(null);
   const minimaxObjectUrlRef = useRef<string | null>(null);
-  const minimaxAnalyserRafRef = useRef<number | null>(null);
-  const minimaxAudioCtxRef = useRef<AudioContext | null>(null);
   /** MiniMax：真正 onplay 之后才按进度显露字幕，避免 duration/解码前误算成满屏字 */
   const minimaxRevealPlaybackStartedRef = useRef(false);
   /** 播完后延迟清空 playback 状态 */
   const cloneTtsHoldTimerRef = useRef<number | null>(null);
-  const speechSynthRafRef = useRef<number | null>(null);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   /** 历史回忆立体轮播当前焦点（与 sortedHistorySessions 下标对齐） */
   const [historySlideIdx, setHistorySlideIdx] = useState(0);
@@ -1595,20 +1592,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       if (conversationModeRef.current === 'text_clone') {
         liveAiVoiceAnalyserRef.current = null;
       }
-      if (minimaxAnalyserRafRef.current != null) {
-        cancelAnimationFrame(minimaxAnalyserRafRef.current);
-        minimaxAnalyserRafRef.current = null;
-      }
-      try {
-        void minimaxAudioCtxRef.current?.close();
-      } catch {
-        /* ignore */
-      }
-      minimaxAudioCtxRef.current = null;
-      if (speechSynthRafRef.current != null) {
-        cancelAnimationFrame(speechSynthRafRef.current);
-        speechSynthRafRef.current = null;
-      }
     };
 
     const stopMinimaxPlayback = () => {
@@ -1722,16 +1705,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         return;
       }
 
-      const runSpeechSynthPulse = () => {
-        const tick = (t0: number) => {
-          if (!isCurrentEpoch()) return;
-          const t = (performance.now() - t0) / 1000;
-          onSpeechValueRef.current?.(0.38 + Math.sin(t * 9.2) * 0.16);
-          speechSynthRafRef.current = requestAnimationFrame(() => tick(t0));
-        };
-        speechSynthRafRef.current = requestAnimationFrame(() => tick(performance.now()));
-      };
-
       const bindSpeechSynthUtterance = (utterance: SpeechSynthesisUtterance) => {
         let synthStarted = false;
         let revealTimerId: number | null = null;
@@ -1764,7 +1737,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           console.info(`[TTS] onstart epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
           if (!isCurrentEpoch()) return;
           synthStarted = true;
-          runSpeechSynthPulse();
           setCloneTtsRevealLen((n) => Math.max(n, 1));
           startRevealTimer();
         };
@@ -1772,10 +1744,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           clearRevealTimer();
           console.info(`[TTS] onend epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
           if (!isCurrentEpoch()) return;
-          if (speechSynthRafRef.current != null) {
-            cancelAnimationFrame(speechSynthRafRef.current);
-            speechSynthRafRef.current = null;
-          }
           onSpeechValueRef.current?.(0);
           scheduleCloneTtsDone({ postSpeechHoldMs: CLONE_TTS_POST_SPEECH_HOLD_MS });
         };
@@ -1786,10 +1754,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
           /** 安卓 Chrome：cancel() 同步触发 onerror（error=canceled），旧回合应忽略 */
           if (!isCurrentEpoch()) return;
           if (errMsg === 'canceled' || errMsg === 'interrupted') return;
-          if (speechSynthRafRef.current != null) {
-            cancelAnimationFrame(speechSynthRafRef.current);
-            speechSynthRafRef.current = null;
-          }
           onSpeechValueRef.current?.(0);
           scheduleCloneTtsDone();
         };
@@ -1815,33 +1779,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         }
       };
 
-      const startMinimaxAnalyserLoop = (audio: HTMLAudioElement, analyser: AnalyserNode) => {
-        const data = new Uint8Array(analyser.frequencyBinCount);
-        const plain = speakSlice;
-        const tick = () => {
-          analyser.getByteFrequencyData(data);
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) sum += data[i];
-          const avg = sum / data.length / 255;
-          onSpeechValueRef.current?.(Math.min(1.45, avg * 19 + 0.1));
-
-          if (minimaxRevealPlaybackStartedRef.current) {
-            const d = audio.duration;
-            const ct = audio.currentTime;
-            if (Number.isFinite(d) && d > 0.05 && Number.isFinite(ct)) {
-              const ratio = Math.min(1, ct / d);
-              const n = Math.max(0, Math.ceil(plain.length * ratio));
-              if (Number.isFinite(n)) setCloneTtsRevealLen(n);
-            }
-          }
-
-          if (!audio.paused && !audio.ended) {
-            minimaxAnalyserRafRef.current = requestAnimationFrame(tick);
-          }
-        };
-        minimaxAnalyserRafRef.current = requestAnimationFrame(tick);
-      };
-
       if (getMinimaxApiKey()) {
         const ac = new AbortController();
         minimaxSpeakAbortRef.current = ac;
@@ -1865,33 +1802,6 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             const audio = new Audio(objectUrl);
             minimaxAudioRef.current = audio;
 
-            /**
-             * 安卓浏览器：AudioContext 若在非用户手势（useEffect）中创建则处于 suspended 状态，
-             * createMediaElementSource 会劫持音频输出 → 声音被吞。
-             * 先尝试 resume，成功才走 AudioContext 声纹；失败则直接播放，声纹用合成波形。
-             */
-            let analyser: AnalyserNode | null = null;
-            let ctx: AudioContext | null = null;
-            try {
-              const ACtor = window.AudioContext || (window as any).webkitAudioContext;
-              if (ACtor) {
-                const tryCtx = new ACtor();
-                try { await tryCtx.resume(); } catch { /* resume 失败，走直接播放 */ }
-                if (tryCtx.state === 'running') {
-                  const src = tryCtx.createMediaElementSource(audio);
-                  analyser = tryCtx.createAnalyser();
-                  analyser.fftSize = 256;
-                  src.connect(analyser);
-                  analyser.connect(tryCtx.destination);
-                  ctx = tryCtx;
-                  minimaxAudioCtxRef.current = ctx;
-                  liveAiVoiceAnalyserRef.current = analyser;
-                } else {
-                  try { await tryCtx.close(); } catch { /* ignore */ }
-                }
-              }
-            } catch { /* AudioContext 不可用，直接播放 */ }
-
             const teardownMinimaxAudioSurface = () => {
               stopMinimaxPlaybackVisual();
               onSpeechValueRef.current?.(0);
@@ -1909,10 +1819,8 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
 
             audio.onplay = () => {
               console.info(`[TTS] MiniMax onplay epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
-              if (ctx) void ctx.resume();
               minimaxRevealPlaybackStartedRef.current = true;
               setCloneTtsRevealLen((n) => Math.max(n, 1));
-              if (analyser) startMinimaxAnalyserLoop(audio, analyser);
             };
             audio.onended = () => {
               console.info(`[TTS] MiniMax onended epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
@@ -3733,9 +3641,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
       (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) &&
       isSpeaking;
 
-    /** 勿依赖 aiMain 长度：自动朗读在出声前有意清空字幕，若还要求 caption 则画布永远不启动 */
-    const cloneAiPanelVoiceprintVisible =
-      conversationMode === 'text_clone' && (isSpeaking || cloneAwaitingTtsStart);
+    /** 复刻模式不再绘制 AI 声纹 canvas（简化链路，避免 AudioContext/Analyser 复杂度） */
+    const cloneAiPanelVoiceprintVisible = false;
 
     const aiPanelVoiceprintVisible =
       liveAiPanelVoiceprintVisible || cloneAiPanelVoiceprintVisible;
@@ -4336,16 +4243,6 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                       <div className="shrink-0 border-b border-zinc-800/60 px-2.5 py-1 text-[9px] font-medium uppercase tracking-wider text-zinc-500 not-italic">
                         <span className="line-clamp-1 normal-case tracking-normal">{aiDisplayName}</span>
                       </div>
-                      {isSpeaking || cloneAwaitingTtsStart ? (
-                        <div className="shrink-0 px-2 pb-1 pt-1" aria-hidden>
-                          <canvas
-                            ref={voiceprintAiCanvasRef}
-                            className="mx-auto block h-[52px] w-full max-w-full rounded-md bg-black ring-1 ring-rose-950/45"
-                            width={VOICEPRINT_CANVAS_W}
-                            height={VOICEPRINT_CANVAS_H}
-                          />
-                        </div>
-                      ) : null}
                       <div
                         ref={cloneAiCaptionScrollRef}
                         className="no-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain px-2.5 py-2 text-left [overflow-anchor:none]"
