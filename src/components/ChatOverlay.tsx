@@ -1364,13 +1364,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       if (lastModelIdx >= 0) {
         if (cloneTtsPostSpeechHold) {
           aiMain = lastModel;
-        } else if (ttsStreaming) {
-          const cap =
-            Number.isFinite(cloneTtsRevealLen) && cloneTtsRevealLen >= 0
-              ? Math.min(lastModel.length, cloneTtsRevealLen)
-              : 0;
-          aiMain = lastModel.slice(0, cap);
-        } else if (!isAutoSpeak) {
+        } else if (ttsStreaming && cloneTtsRevealLen > 0) {
+          aiMain = lastModel.slice(0, Math.min(lastModel.length, cloneTtsRevealLen));
+        } else {
           aiMain = lastModel;
         }
       }
@@ -1416,7 +1412,7 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   const cloneAiCaptionAlt = cloneCaptionState?.aiAlt ?? '';
   const cloneWaitingForModel = cloneCaptionState?.waitingForModel ?? false;
   const cloneAwaitingTtsStart = cloneCaptionState?.awaitingTtsStart ?? false;
-  /** 复刻：仅在听写中 / 发送后短时回声显示文案，不用会话里上一轮 userMain（避免第二轮仍显示上一句） */
+  /** 复刻：听写中显示实时状态，识别完显示文字，AI 回复后隐藏 */
   const cloneUserSubtitleDisplay = isCloneDictating
     ? cloneLiveCaptionUserLine.trim()
     : cloneUserPostDictationHold && cloneUserPostDictationEcho.trim()
