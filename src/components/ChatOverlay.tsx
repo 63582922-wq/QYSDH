@@ -1818,7 +1818,19 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
             audio.onplay = () => {
               console.info(`[TTS] MiniMax onplay epoch=${messageKey} isCurrent=${isCurrentEpoch()} renderPhase=${isRenderingRef.current}`);
               minimaxRevealPlaybackStartedRef.current = true;
-              setCloneTtsRevealLen((n) => Math.max(n, 1));
+              // 立即按当前播放位置算初始字幕长度，避免声音先出字幕滞后
+              const initReveal = () => {
+                const d = audio.duration;
+                const ct = audio.currentTime;
+                if (Number.isFinite(d) && d > 0.05 && Number.isFinite(ct) && ct > 0) {
+                  const ratio = Math.min(1, ct / d);
+                  const n = Math.max(1, Math.ceil(speakSlice.length * ratio));
+                  setCloneTtsRevealLen(n);
+                } else {
+                  setCloneTtsRevealLen((n) => Math.max(n, 1));
+                }
+              };
+              initReveal();
               minimaxRevealIntervalRef.current = window.setInterval(() => {
                 if (!isCurrentEpoch() || !minimaxRevealPlaybackStartedRef.current) return;
                 const d = audio.duration;
@@ -4187,15 +4199,21 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
              ) : null}
              </div>
            )}
-          {conversationMode === 'text_clone' && (isCloneDictating || cloneLiveCaptionUserLine || showCloneAiCaptionPanel) ? (
+          {conversationMode === 'text_clone' && (isCloneDictating || cloneUserSubtitleDisplay || showCloneAiCaptionPanel) ? (
                 <div
                   className="pointer-events-auto mb-1.5 w-full font-serif italic"
                   aria-live="polite"
                   aria-relevant="additions text"
                 >
-                  {isCloneDictating || cloneLiveCaptionUserLine ? (
+                  {cloneUserSubtitleDisplay ? (
+                    <p className={`mb-1 text-center text-[10px] tracking-wider not-italic ${
+                      isCloneDictating ? 'text-zinc-500 animate-pulse' : 'text-zinc-400'
+                    }`}>
+                      {isCloneDictating && !cloneUserSubtitleDisplay.trim() ? (language === 'zh' ? '正在录音…' : 'Recording…') : cloneUserSubtitleDisplay}
+                    </p>
+                  ) : isCloneDictating ? (
                     <p className="mb-1 text-center text-[10px] tracking-wider text-zinc-500 not-italic animate-pulse">
-                      {cloneUserSubtitleDisplay || (language === 'zh' ? '正在录音…' : 'Recording…')}
+                      {language === 'zh' ? '正在录音…' : 'Recording…'}
                     </p>
                   ) : null}
                   {showCloneAiCaptionPanel ? (
