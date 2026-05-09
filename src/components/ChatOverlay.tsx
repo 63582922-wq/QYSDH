@@ -4177,12 +4177,18 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
              ) : null}
              </div>
            )}
-          {conversationMode === 'text_clone' && showCloneAiCaptionPanel ? (
+          {conversationMode === 'text_clone' && (isCloneDictating || cloneLiveCaptionUserLine || showCloneAiCaptionPanel) ? (
                 <div
                   className="pointer-events-auto mb-1.5 w-full font-serif italic"
                   aria-live="polite"
                   aria-relevant="additions text"
                 >
+                  {isCloneDictating || cloneLiveCaptionUserLine ? (
+                    <p className="mb-1 text-center text-[10px] tracking-wider text-zinc-500 not-italic animate-pulse">
+                      {cloneUserSubtitleDisplay || (language === 'zh' ? '正在录音…' : 'Recording…')}
+                    </p>
+                  ) : null}
+                  {showCloneAiCaptionPanel ? (
                   <div
                     className="animate-in fade-in slide-in-from-bottom-1 flex min-h-[3rem] max-h-[min(52vh,22rem)] flex-col overflow-hidden rounded-xl border border-zinc-800/90 bg-zinc-950/90 shadow-inner backdrop-blur-md duration-300"
                   >
@@ -4232,6 +4238,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                       ) : null}
                     </div>
                   </div>
+                  ) : null}
                 </div>
           ) : null}
           {allowLiveVoice ? (
