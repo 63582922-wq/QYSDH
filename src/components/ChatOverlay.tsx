@@ -112,9 +112,6 @@ const LIVE_VOICE_TAIL_MS = 420;
 const LIVE_MIC_WEBSOCKET_SAMPLES = 4096;
 /** Gemini Live 声明的 PCM 采样率；须与 `sendRealtimeInput` 的 mimeType 及 payload 一致 */
 const LIVE_GEMINI_INPUT_RATE = 16000;
-/** 1006/1011 无干净关闭帧时自动重连次数上限（单次点麦克风会话内） */
-const LIVE_WS_ABNORMAL_MAX_AUTO_RETRIES = 2;
-
 /**
  * 线性重采样到固定输出长度（mic 块）：用于 iOS/WebKit 实际 44.1k/48k 而 API 要求 16k 的场景。
  */
@@ -1058,6 +1055,10 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   }, []);
   const [voiceBlockingMessage, setVoiceBlockingMessage] = useState<string | null>(null);
   const voiceBlockingRetryRef = useRef<(() => void) | null>(null);
+  /** Live 异常断线后：继续同一会话（session resumption）或新开语音会话 */
+  const [liveResumeChoiceOpen, setLiveResumeChoiceOpen] = useState(false);
+  /** 弹窗打开时是否已有可恢复的 handle（无则禁用「继续」） */
+  const [liveResumeHasHandle, setLiveResumeHasHandle] = useState(false);
 
   /** 对话层关闭时收起所有 Portal 弹层，避免 isOpen 已 false 仍保留状态导致下一帧与 DOM 不一致（insertBefore 报错） */
   useEffect(() => {
@@ -1066,6 +1067,9 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
     setShowSavePreview(false);
     setVoiceBlockingMessage(null);
     voiceBlockingRetryRef.current = null;
+    setLiveResumeChoiceOpen(false);
+    liveResumptionOfferPendingRef.current = false;
+    liveResumptionHandleRef.current = null;
   }, [isOpen]);
 
   /** 改 session 音色后强制重渲染（sessionStorage 本身不触发 React） */
@@ -1111,6 +1115,14 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
   /** 单次开麦周期内 1006/1011 自动重连已尝试次数；成功连上后归零 */
   const liveWsAbnormalRetryRef = useRef(0);
   const liveVoiceReconnectTimerRef = useRef<number | null>(null);
+  /** Gemini Live `sessionResumption`：服务端 `SessionResumptionUpdate.newHandle`，用于断线后续聊 */
+  const liveResumptionHandleRef = useRef<string | null>(null);
+  /** 异常断线后须弹窗询问；为真时用户再点麦克风也会先弹窗 */
+  const liveResumptionOfferPendingRef = useRef(false);
+  /** 下一次 `live.connect`：`default` 新开（仍收 token）、`resume` 带 handle、`fresh` 清 handle 后新开 */
+  const liveVoiceConnectResumeIntentRef = useRef<'default' | 'resume' | 'fresh'>('default');
+  /** 本轮 connect 是否为「继续上次」；失败时用于重新打开选择窗 */
+  const liveVoiceConnectAttemptWasResumeRef = useRef(false);
   /** onclose 定时器重连须调用最新 startVoiceMode，避免闭包陈旧 */
   const startVoiceModeRef = useRef<(() => void) | null>(null);
   /** 供其它 effect 调用最新 stopVoiceMode，避免依赖函数本体导致重复执行 */
@@ -1645,25 +1657,38 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       }
     };
 
+    /** 双 rAF：离开浏览器当前任务/commit 后再 setState；比 setTimeout(0) 在部分移动 WebView 上更稳 */
+    const deferCloneTtsStateUpdates = (fn: () => void) => {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(fn);
+      });
+    };
+
     const scheduleCloneTtsDone = (opts?: { postSpeechHoldMs?: number }) => {
       console.info(`[TTS] scheduleCloneTtsDone epoch=${lastSpokenMessageIdRef.current} holdMs=${opts?.postSpeechHoldMs ?? 0} renderPhase=${isRenderingRef.current}`);
       clearFloatingDisplayTimers();
       clearCloneTtsHoldTimer();
       const holdMs = opts?.postSpeechHoldMs ?? 0;
-      setIsSpeaking(false);
-      if (holdMs > 0) {
-        setCloneTtsPlaybackMsgIdx(null);
-        setCloneTtsRevealLen(0);
-        setCloneTtsPostSpeechHold(true);
-        cloneTtsHoldTimerRef.current = window.setTimeout(() => {
-          cloneTtsHoldTimerRef.current = null;
+      // 所有 setState 经双 rAF 延迟，避免 speechSynthesis / cleanup 与渲染帧嵌套更新崩溃
+      const applyState = () => {
+        setIsSpeaking(false);
+        if (holdMs > 0) {
+          setCloneTtsPlaybackMsgIdx(null);
+          setCloneTtsRevealLen(0);
+          setCloneTtsPostSpeechHold(true);
+          cloneTtsHoldTimerRef.current = window.setTimeout(() => {
+            cloneTtsHoldTimerRef.current = null;
+            deferCloneTtsStateUpdates(() => {
+              setCloneTtsPostSpeechHold(false);
+            });
+          }, holdMs);
+        } else {
           setCloneTtsPostSpeechHold(false);
-        }, holdMs);
-      } else {
-        setCloneTtsPostSpeechHold(false);
-        setCloneTtsPlaybackMsgIdx(null);
-        setCloneTtsRevealLen(0);
-      }
+          setCloneTtsPlaybackMsgIdx(null);
+          setCloneTtsRevealLen(0);
+        }
+      };
+      deferCloneTtsStateUpdates(applyState);
     };
 
     /** 复刻 · 自动朗读：MiniMax / 系统 TTS；字幕在「AI」面板（与 Live 同布局） */
@@ -1874,13 +1899,13 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
       console.info(`[TTS] cleanupFloatingAndTts epoch=${lastSpokenMessageIdRef.current} renderPhase=${isRenderingRef.current}`);
       clearFloatingDisplayTimers();
       clearCloneTtsHoldTimer();
-      setCloneTtsPostSpeechHold(false);
       // 先清 epoch，再 cancel，避免 cancel 同步触发 onerror 时 isCurrentEpoch() 仍为 true → setState → 崩溃
       lastSpokenMessageIdRef.current = '';
       window.speechSynthesis.cancel();
       minimaxSpeakAbortRef.current?.abort();
       minimaxSpeakAbortRef.current = null;
       stopMinimaxPlaybackVisual();
+      if (minimaxRevealIntervalRef.current != null) { clearInterval(minimaxRevealIntervalRef.current); minimaxRevealIntervalRef.current = null; }
       if (minimaxAudioRef.current) {
         try {
           minimaxAudioRef.current.pause();
@@ -1897,9 +1922,11 @@ const ChatOverlay = forwardRef<ChatOverlayHandle, ChatOverlayProps>(function Cha
         }
         minimaxObjectUrlRef.current = null;
       }
-      /** 勿在此处清空 `cloneTtsPlaybackMsgIdx` / `cloneTtsRevealLen`：新一轮 model 到达时 cleanup 先执行，
-       * 会与 `sendMessage` 刚写入的播放索引竞态，导致第 2 条及以后自动朗读时字幕面板拿不到逐字长度。 */
-      setIsSpeaking(false);
+      // cleanup 在 commit 阶段运行；双 rAF 再 setState，避免与当前提交/布局嵌套更新
+      deferCloneTtsStateUpdates(() => {
+        setCloneTtsPostSpeechHold(false);
+        setIsSpeaking(false);
+      });
     };
 
     if (textCloneReadAloud) {
@@ -2767,6 +2794,9 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         window.clearTimeout(liveVoiceReconnectTimerRef.current);
         liveVoiceReconnectTimerRef.current = null;
       }
+      setLiveResumeChoiceOpen(false);
+      liveResumptionOfferPendingRef.current = false;
+      liveResumptionHandleRef.current = null;
     }
   }, [conversationMode]);
 
@@ -2924,6 +2954,15 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
        );
        return;
      }
+     const liveConnectResumeIntent = liveVoiceConnectResumeIntentRef.current;
+     liveVoiceConnectResumeIntentRef.current = 'default';
+     const reopenLiveResumeChoiceAfterAbort = () => {
+       if (liveConnectResumeIntent !== 'resume') return;
+       liveResumptionOfferPendingRef.current = true;
+       setLiveVoiceHandoff(true);
+       setLiveResumeHasHandle(Boolean(liveResumptionHandleRef.current));
+       setLiveResumeChoiceOpen(true);
+     };
      voiceLiveReadyRef.current = false;
      setIsVoiceConnecting(true);
 
@@ -2949,6 +2988,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
            ? '语音需在安全网页环境使用（HTTPS）。非加密访问时浏览器可能无法授权麦克风，请改用加密地址打开，或使用下方文字输入。'
            : 'Voice needs HTTPS. On plain HTTP, the browser may block the microphone. Open this page over HTTPS or use text below.',
        );
+       reopenLiveResumeChoiceAfterAbort();
        return;
      }
 
@@ -2959,6 +2999,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
        setVoiceBlockingMessage(
          language === 'zh' ? '当前浏览器无法使用麦克风。' : 'This browser cannot use the microphone.',
        );
+       reopenLiveResumeChoiceAfterAbort();
        return;
      }
 
@@ -3043,6 +3084,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                  ? '无法使用麦克风，请检查系统与浏览器权限后重试。'
                  : 'Microphone unavailable. Check system and browser permissions.',
            );
+           reopenLiveResumeChoiceAfterAbort();
            return;
          }
          mediaStreamRef.current = stream;
@@ -3183,6 +3225,16 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         let lastLiveConnectError: unknown = null;
         const liveModel = LIVE_VOICE_MODEL_ID;
         try {
+            if (liveConnectResumeIntent === 'fresh') {
+              liveResumptionHandleRef.current = null;
+            }
+            const sessionResumption =
+              liveConnectResumeIntent === 'resume' && liveResumptionHandleRef.current
+                ? { handle: liveResumptionHandleRef.current }
+                : {};
+            liveVoiceConnectAttemptWasResumeRef.current =
+              liveConnectResumeIntent === 'resume' && Boolean(liveResumptionHandleRef.current);
+
             const connectGen = ++liveVoiceSessionGenRef.current;
             const sessionPromise = getGeminiClient().live.connect({
               model: liveModel,
@@ -3196,6 +3248,8 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                   }
                   voiceLiveReadyRef.current = true;
                   liveWsAbnormalRetryRef.current = 0;
+                  liveVoiceConnectAttemptWasResumeRef.current = false;
+                  liveResumptionOfferPendingRef.current = false;
                   window.clearTimeout(timeoutId);
                   setIsVoiceConnecting(false);
                   setIsVoiceMode(true);
@@ -3209,6 +3263,11 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                 },
                 onmessage: async (message: LiveServerMessage) => {
                   if (connectGen !== liveVoiceSessionGenRef.current) return;
+
+                  const resUp = message.sessionResumptionUpdate;
+                  if (resUp?.newHandle) {
+                    liveResumptionHandleRef.current = resUp.newHandle;
+                  }
 
                   if (message.serverContent?.interrupted) {
                     audioSourcesRef.current.forEach((s) => s.stop());
@@ -3281,52 +3340,43 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                       language === 'zh' ? '语音服务暂时不可用，请稍后再试。' : 'Voice service is temporarily unavailable.',
                     );
                   }
-                  stopVoiceMode();
-
-                  if (
+                  const shouldOfferResume =
                     abnormalWs &&
                     !liveVoiceUserStoppedRef.current &&
                     isOpenRef.current &&
-                    conversationModeRef.current === 'live'
-                  ) {
-                    liveWsAbnormalRetryRef.current += 1;
-                    const n = liveWsAbnormalRetryRef.current;
-                    if (n <= LIVE_WS_ABNORMAL_MAX_AUTO_RETRIES) {
-                      const delayMs = 750 * n;
-                      console.info(
-                        `[Live voice] WebSocket ${code}（异常断开），${delayMs}ms 后自动重连 (${n}/${LIVE_WS_ABNORMAL_MAX_AUTO_RETRIES})…`,
-                      );
-                      liveVoiceReconnectTimerRef.current = window.setTimeout(() => {
-                        liveVoiceReconnectTimerRef.current = null;
-                        if (
-                          liveVoiceUserStoppedRef.current ||
-                          !isOpenRef.current ||
-                          conversationModeRef.current !== 'live'
-                        ) {
-                          return;
-                        }
-                        startVoiceModeRef.current?.();
-                      }, delayMs);
-                    } else {
-                      liveWsAbnormalRetryRef.current = 0;
-                      console.warn(
-                        '[Live voice] 已自动重连多次仍异常断开，请检查网络 / VPN / 代理，或稍后手动再开麦克风。',
-                      );
-                      setVoiceBlockingMessage(
-                        language === 'zh'
-                          ? '语音连接反复中断，请更换网络或稍后再试。'
-                          : 'Voice keeps dropping. Try another network or again later.',
-                      );
-                    }
+                    conversationModeRef.current === 'live';
+                  if (shouldOfferResume) {
+                    liveResumptionOfferPendingRef.current = true;
+                    setLiveVoiceHandoff(true);
+                  }
+                  stopVoiceMode({ preserveLiveVoiceHandoff: shouldOfferResume });
+                  if (shouldOfferResume) {
+                    setLiveResumeHasHandle(Boolean(liveResumptionHandleRef.current));
+                    setLiveResumeChoiceOpen(true);
+                    console.info('[Live voice] 异常断开，已弹出「继续 / 新对话」选择');
                   }
                 },
                 onerror: (e: unknown) => {
                   if (connectGen !== liveVoiceSessionGenRef.current) return;
                   console.error('[Live voice] error', e);
-                  setVoiceBlockingMessage(
-                    language === 'zh' ? '语音连接出错，请检查网络后重试。' : 'Voice connection error. Check your network and retry.',
-                  );
-                  stopVoiceMode();
+                  const shouldOfferResume =
+                    !liveVoiceUserStoppedRef.current &&
+                    isOpenRef.current &&
+                    conversationModeRef.current === 'live';
+                  if (!shouldOfferResume) {
+                    setVoiceBlockingMessage(
+                      language === 'zh' ? '语音连接出错，请检查网络后重试。' : 'Voice connection error. Check your network and retry.',
+                    );
+                  }
+                  if (shouldOfferResume) {
+                    liveResumptionOfferPendingRef.current = true;
+                    setLiveVoiceHandoff(true);
+                  }
+                  stopVoiceMode({ preserveLiveVoiceHandoff: shouldOfferResume });
+                  if (shouldOfferResume) {
+                    setLiveResumeHasHandle(Boolean(liveResumptionHandleRef.current));
+                    setLiveResumeChoiceOpen(true);
+                  }
                 },
               },
               config: {
@@ -3343,6 +3393,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                 outputAudioTranscription: {},
                 inputAudioTranscription: {},
                 systemInstruction: getLiveVoiceSystemInstruction(),
+                sessionResumption,
               },
             });
             session = await sessionPromise;
@@ -3385,12 +3436,21 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
      } catch(e) {
          window.clearTimeout(timeoutId);
          console.error('Failed to start voice mode', e);
+         const reopenResume = liveVoiceConnectAttemptWasResumeRef.current;
+         liveVoiceConnectAttemptWasResumeRef.current = false;
          stopVoiceMode();
-         setVoiceBlockingMessage(
-           language === 'zh'
-             ? '无法启动语音，请检查网络与安全访问方式（HTTPS）后重试。'
-             : 'Could not start voice. Check your network and HTTPS, then try again.',
-         );
+         if (reopenResume) {
+           liveResumptionOfferPendingRef.current = true;
+           setLiveVoiceHandoff(true);
+           setLiveResumeHasHandle(Boolean(liveResumptionHandleRef.current));
+           setLiveResumeChoiceOpen(true);
+         } else {
+           setVoiceBlockingMessage(
+             language === 'zh'
+               ? '无法启动语音，请检查网络与安全访问方式（HTTPS）后重试。'
+               : 'Could not start voice. Check your network and HTTPS, then try again.',
+           );
+         }
      }
   };
 
@@ -3403,11 +3463,20 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
      if (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) {
          liveVoiceUserStoppedRef.current = true;
          liveWsAbnormalRetryRef.current = 0;
+         liveResumptionOfferPendingRef.current = false;
+         liveResumptionHandleRef.current = null;
+         setLiveResumeChoiceOpen(false);
          stopVoiceMode();
      } else {
          liveVoiceUserStoppedRef.current = false;
          liveWsAbnormalRetryRef.current = 0;
-         startVoiceMode();
+         if (liveResumptionOfferPendingRef.current) {
+           setLiveResumeHasHandle(Boolean(liveResumptionHandleRef.current));
+           setLiveVoiceHandoff(true);
+           setLiveResumeChoiceOpen(true);
+           return;
+         }
+         void startVoiceMode();
      }
   };
 
@@ -3415,6 +3484,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
   useEffect(() => {
     if (!showHistoryModal) return;
     if (conversationMode !== 'live') return;
+    setLiveResumeChoiceOpen(false);
     if (isVoiceMode || isVoiceConnecting || liveVoiceHandoff) {
       stopVoiceModeRef.current();
     }
@@ -4060,6 +4130,7 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
                            setLiveVoiceHandoff(true);
                            stopVoiceMode({ preserveLiveVoiceHandoff: true });
                            queueMicrotask(() => {
+                             liveVoiceConnectResumeIntentRef.current = 'fresh';
                              void startVoiceMode();
                            });
                          }
@@ -4674,6 +4745,61 @@ Do not use meta-AI phrases ("As an AI"), avoid bullet-point lecturing, and avoid
         </div>,
         getAppPortalNode(),
         )}
+    {liveResumeChoiceOpen &&
+      createPortal(
+        <div className="fixed inset-0 z-[10002] flex items-center justify-center bg-black/75 p-6 backdrop-blur-md pointer-events-auto pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="w-full max-w-sm rounded-2xl border border-zinc-700/80 bg-zinc-950 px-5 py-6 shadow-2xl"
+          >
+            <p className="text-left text-[15px] font-medium text-zinc-100">
+              {language === 'zh' ? '语音已断开' : 'Voice disconnected'}
+            </p>
+            <p className="mt-2 text-left text-[13px] leading-relaxed text-zinc-400">
+              {language === 'zh'
+                ? '请选择如何重新连接实时语音。本地聊天记录仍会保留。'
+                : 'Choose how to reconnect to live voice. Your local chat history stays.'}
+            </p>
+            {!liveResumeHasHandle ? (
+              <p className="mt-2 text-left text-[12px] leading-relaxed text-amber-200/90">
+                {language === 'zh'
+                  ? '当前没有可恢复的服务端会话令牌，仅能开启新的语音会话。'
+                  : 'No server resumption token yet—only a new voice session is available.'}
+              </p>
+            ) : null}
+            <div className="mt-6 flex flex-col gap-2">
+              <button
+                type="button"
+                disabled={!liveResumeHasHandle || isVoiceConnecting}
+                className="min-h-[44px] w-full rounded-xl border border-emerald-700/60 bg-emerald-950/50 py-3 text-sm font-medium text-emerald-100 touch-manipulation active:bg-emerald-900/50 disabled:cursor-not-allowed disabled:opacity-40"
+                onClick={() => {
+                  if (!liveResumptionHandleRef.current || isVoiceConnecting) return;
+                  setLiveResumeChoiceOpen(false);
+                  liveVoiceConnectResumeIntentRef.current = 'resume';
+                  void startVoiceMode();
+                }}
+              >
+                {language === 'zh' ? '继续上一次对话' : 'Resume previous session'}
+              </button>
+              <button
+                type="button"
+                disabled={isVoiceConnecting}
+                className="min-h-[44px] w-full rounded-xl border border-zinc-600 bg-zinc-900 py-3 text-sm font-medium text-zinc-100 touch-manipulation active:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+                onClick={() => {
+                  if (isVoiceConnecting) return;
+                  setLiveResumeChoiceOpen(false);
+                  liveVoiceConnectResumeIntentRef.current = 'fresh';
+                  void startVoiceMode();
+                }}
+              >
+                {language === 'zh' ? '开启新对话' : 'Start new voice session'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        getAppPortalNode(),
+      )}
     {voiceBlockingMessage &&
       createPortal(
         <div className="fixed inset-0 z-[10001] flex items-center justify-center bg-black/75 p-6 backdrop-blur-md pointer-events-auto pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
